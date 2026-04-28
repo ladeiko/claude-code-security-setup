@@ -9,9 +9,9 @@ PASSED=0
 FAILED=0
 
 # Total deny rules added by the installer (keep in sync with install.sh).
-DENY_RULE_COUNT=62
+DENY_RULE_COUNT=70
 # Total PreToolUse hook entries added by the installer.
-HOOK_ENTRY_COUNT=3
+HOOK_ENTRY_COUNT=4
 
 # --- Helpers ---
 
@@ -103,9 +103,11 @@ setup
   assert_file_exists "security-validator.py created" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_exists "prevent-force-push.py created" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_exists "prevent-env-exfil.py created" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
+  assert_file_exists "prevent-claude-tamper.py created" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
   assert_file_executable "security-validator.py is executable" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_executable "prevent-force-push.py is executable" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_executable "prevent-env-exfil.py is executable" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
+  assert_file_executable "prevent-claude-tamper.py is executable" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
 
   deny_count=$(json_len "$FAKE_HOME/.claude/settings.json" "data['permissions']['deny']")
   assert_eq "deny list has $DENY_RULE_COUNT rules" "$DENY_RULE_COUNT" "$deny_count"
@@ -197,6 +199,7 @@ setup
   assert_file_not_exists "security-validator.py removed" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_not_exists "prevent-force-push.py removed" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_not_exists "prevent-env-exfil.py removed" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
+  assert_file_not_exists "prevent-claude-tamper.py removed" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
 
   # settings.json should be essentially empty (clean keys removed)
   has_permissions=$(python3 -c "import json; data=json.load(open('$FAKE_HOME/.claude/settings.json')); print('permissions' in data)")
@@ -265,6 +268,7 @@ setup
   assert_file_not_exists "security-validator.py still absent" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_not_exists "prevent-force-push.py still absent" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_not_exists "prevent-env-exfil.py still absent" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
+  assert_file_not_exists "prevent-claude-tamper.py still absent" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
 teardown
 
 echo ""
@@ -276,6 +280,7 @@ setup
   assert_file_not_exists "no security-validator.py created" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_not_exists "no prevent-force-push.py created" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_not_exists "no prevent-env-exfil.py created" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
+  assert_file_not_exists "no prevent-claude-tamper.py created" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
 teardown
 
 echo ""
@@ -294,9 +299,11 @@ setup
   assert_file_exists "security-validator.py exists after reinstall" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_exists "prevent-force-push.py exists after reinstall" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_exists "prevent-env-exfil.py exists after reinstall" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
+  assert_file_exists "prevent-claude-tamper.py exists after reinstall" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
   assert_file_executable "security-validator.py executable after reinstall" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_executable "prevent-force-push.py executable after reinstall" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_executable "prevent-env-exfil.py executable after reinstall" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
+  assert_file_executable "prevent-claude-tamper.py executable after reinstall" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
 teardown
 
 echo ""
@@ -384,6 +391,123 @@ setup
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 script.py"}}')
   assert_eq "python3 script.py allowed (exit 0)" "exit:0" "$result"
+teardown
+
+echo ""
+echo "=== Test 13: prevent-claude-tamper blocks ~/.claude/ writes via Bash ==="
+setup
+  bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
+  HOOK="$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
+
+  # Output redirection — the headline bypass we are closing
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"echo {} > ~/.claude/settings.json"}}')
+  assert_eq "echo > ~/.claude/settings.json blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"echo foo >> ~/.claude/hooks/security-validator.py"}}')
+  assert_eq ">> ~/.claude/hooks/... blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat new.json > /Users/admin/.claude/settings.json"}}')
+  assert_eq "absolute /Users/.../.claude/ redirect blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"echo x > .claude/settings.json"}}')
+  assert_eq "project-relative .claude/ redirect blocked" "exit:2" "$result"
+
+  # tee
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"echo x | tee ~/.claude/settings.json"}}')
+  assert_eq "tee ~/.claude/... blocked" "exit:2" "$result"
+
+  # cp / mv into .claude/
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cp /tmp/foo ~/.claude/hooks/prevent-env-exfil.py"}}')
+  assert_eq "cp into ~/.claude/hooks/ blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"mv /tmp/foo ~/.claude/settings.json"}}')
+  assert_eq "mv into ~/.claude/ blocked" "exit:2" "$result"
+
+  # sed -i
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"sed -i.bak /security-validator/d ~/.claude/settings.json"}}')
+  assert_eq "sed -i ~/.claude/... blocked" "exit:2" "$result"
+
+  # rm
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm ~/.claude/hooks/prevent-force-push.py"}}')
+  assert_eq "rm ~/.claude/hooks/... blocked" "exit:2" "$result"
+
+  # chmod (disable executable bit)
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"chmod -x ~/.claude/hooks/security-validator.py"}}')
+  assert_eq "chmod ~/.claude/... blocked" "exit:2" "$result"
+
+  # python -c "open(..., 'w')"
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 -c \"open('"'"'/Users/admin/.claude/settings.json'"'"', '"'"'w'"'"').write('"'"'{}'"'"')\""}}')
+  assert_eq "python -c open(.claude/...,w) blocked" "exit:2" "$result"
+
+  # truncate / dd of=
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"truncate -s0 ~/.claude/settings.json"}}')
+  assert_eq "truncate ~/.claude/... blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"dd if=/dev/null of=~/.claude/settings.json"}}')
+  assert_eq "dd of=~/.claude/... blocked" "exit:2" "$result"
+
+  # Benign reads / cd should be allowed
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"ls ~/.claude/hooks/"}}')
+  assert_eq "ls ~/.claude/ allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat ~/.claude/settings.json"}}')
+  assert_eq "cat ~/.claude/settings.json allowed (read-only)" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cd ~/.claude && ls"}}')
+  assert_eq "cd ~/.claude allowed" "exit:0" "$result"
+
+  # Unrelated paths must not match
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"echo hello > /tmp/foo"}}')
+  assert_eq "redirect to /tmp/ allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm /tmp/something"}}')
+  assert_eq "rm /tmp/something allowed" "exit:0" "$result"
+
+  # Non-Bash tool — pass through
+  result=$(run_hook "$HOOK" '{"tool_name":"Edit","tool_input":{"file_path":"~/.claude/settings.json"}}')
+  assert_eq "non-Bash tool pass-through (exit 0)" "exit:0" "$result"
+teardown
+
+echo ""
+echo "=== Test 14: prevent-env-exfil scans MultiEdit edits[].new_string ==="
+setup
+  bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
+  HOOK="$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
+
+  # MultiEdit with one edit that drops a direct .env open() — must be blocked
+  result=$(run_hook "$HOOK" '{"tool_name":"MultiEdit","tool_input":{"edits":[{"old_string":"x","new_string":"open(\".env\").read()"}]}}')
+  assert_eq "MultiEdit with open(.env) blocked" "exit:2" "$result"
+
+  # MultiEdit with multiple edits, only one of which is malicious
+  result=$(run_hook "$HOOK" '{"tool_name":"MultiEdit","tool_input":{"edits":[{"old_string":"a","new_string":"foo()"},{"old_string":"b","new_string":"Path(\".env\").read_text()"}]}}')
+  assert_eq "MultiEdit with malicious second edit blocked" "exit:2" "$result"
+
+  # MultiEdit with only safe edits — must pass
+  result=$(run_hook "$HOOK" '{"tool_name":"MultiEdit","tool_input":{"edits":[{"old_string":"a","new_string":"print(\"hello\")"}]}}')
+  assert_eq "MultiEdit with safe edits allowed" "exit:0" "$result"
+
+  # MultiEdit writing dotenv source — allowed (bash-only patterns don't apply to non-Bash)
+  result=$(run_hook "$HOOK" '{"tool_name":"MultiEdit","tool_input":{"edits":[{"old_string":"a","new_string":"from dotenv import load_dotenv\nload_dotenv()"}]}}')
+  assert_eq "MultiEdit with load_dotenv source allowed" "exit:0" "$result"
+teardown
+
+echo ""
+echo "=== Test 15: hooks fail-closed on malformed JSON input ==="
+setup
+  bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
+
+  for h in security-validator.py prevent-force-push.py prevent-env-exfil.py prevent-claude-tamper.py; do
+    HOOK="$FAKE_HOME/.claude/hooks/$h"
+    result=$(echo "this is not json {" | python3 "$HOOK" >/dev/null 2>&1 && echo "exit:0" || echo "exit:$?")
+    # Allow either 1 or 2 — anything non-zero is fail-closed.
+    if [ "$result" = "exit:0" ]; then
+      echo "  FAIL: $h allowed bad JSON (exit 0) — should fail closed"
+      ((FAILED++))
+    else
+      echo "  PASS: $h fail-closed on bad JSON ($result)"
+      ((PASSED++))
+    fi
+  done
 teardown
 
 # --- Summary ---

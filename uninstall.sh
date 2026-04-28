@@ -14,6 +14,7 @@ HOOK_FILES=(
   "$HOOKS_DIR/security-validator.py"
   "$HOOKS_DIR/prevent-force-push.py"
   "$HOOKS_DIR/prevent-env-exfil.py"
+  "$HOOKS_DIR/prevent-claude-tamper.py"
 )
 
 # Temporary backup directory (cleaned up on success)
@@ -141,6 +142,15 @@ deny_rules = {
     'Write(~/.claude/hooks/prevent-force-push.py)',
     'Edit(~/.claude/hooks/prevent-env-exfil.py)',
     'Write(~/.claude/hooks/prevent-env-exfil.py)',
+    'Edit(~/.claude/hooks/prevent-claude-tamper.py)',
+    'Write(~/.claude/hooks/prevent-claude-tamper.py)',
+    # Self-protection: Bash-level tampering with ~/.claude/
+    'Bash(rm ~/.claude/*)',
+    'Bash(rm -rf ~/.claude*)',
+    'Bash(chmod * ~/.claude/*)',
+    'Bash(tee ~/.claude/*)',
+    'Bash(* > ~/.claude/*)',
+    'Bash(* >> ~/.claude/*)',
 }
 
 permissions = settings.get('permissions', {})
@@ -159,6 +169,7 @@ managed_commands = {
     '~/.claude/hooks/security-validator.py',
     '~/.claude/hooks/prevent-force-push.py',
     '~/.claude/hooks/prevent-env-exfil.py',
+    '~/.claude/hooks/prevent-claude-tamper.py',
 }
 
 hooks = settings.get('hooks', {})

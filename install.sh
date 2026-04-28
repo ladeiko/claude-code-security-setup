@@ -14,6 +14,7 @@ HOOK_FILES=(
   "$HOOKS_DIR/security-validator.py"
   "$HOOKS_DIR/prevent-force-push.py"
   "$HOOKS_DIR/prevent-env-exfil.py"
+  "$HOOKS_DIR/prevent-claude-tamper.py"
 )
 
 # Temporary backup directory (cleaned up on success)
@@ -153,6 +154,17 @@ deny_rules = [
     'Write(~/.claude/hooks/prevent-force-push.py)',
     'Edit(~/.claude/hooks/prevent-env-exfil.py)',
     'Write(~/.claude/hooks/prevent-env-exfil.py)',
+    'Edit(~/.claude/hooks/prevent-claude-tamper.py)',
+    'Write(~/.claude/hooks/prevent-claude-tamper.py)',
+    # Self-protection: Bash-level tampering with ~/.claude/
+    # (prevent-claude-tamper.py is the comprehensive backstop; these
+    # deny rules give a fast-fail at the permission layer.)
+    'Bash(rm ~/.claude/*)',
+    'Bash(rm -rf ~/.claude*)',
+    'Bash(chmod * ~/.claude/*)',
+    'Bash(tee ~/.claude/*)',
+    'Bash(* > ~/.claude/*)',
+    'Bash(* >> ~/.claude/*)',
 ]
 
 permissions = settings.setdefault('permissions', {})
@@ -175,7 +187,11 @@ hook_entries = [
         'hooks': [{'type': 'command', 'command': '~/.claude/hooks/prevent-force-push.py'}]
     },
     {
-        'matcher': 'Bash|Edit|Write|NotebookEdit|Read|Grep|Glob',
+        'matcher': 'Bash',
+        'hooks': [{'type': 'command', 'command': '~/.claude/hooks/prevent-claude-tamper.py'}]
+    },
+    {
+        'matcher': 'Bash|Edit|MultiEdit|Write|NotebookEdit|Read|Grep|Glob',
         'hooks': [{'type': 'command', 'command': '~/.claude/hooks/prevent-env-exfil.py'}]
     },
 ]
@@ -275,8 +291,12 @@ import sys
 import re
 
 def main():
-    # Read the PreToolUse input from stdin
-    input_data = json.load(sys.stdin)
+    # Read the PreToolUse input from stdin (fail-closed on parse errors)
+    try:
+        input_data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"Hook input invalid: {e}", file=sys.stderr)
+        sys.exit(2)
 
     # Extract tool information
     tool_name = input_data.get("tool_name", "")
@@ -457,7 +477,11 @@ def check_patterns(text, patterns):
 
 
 def main():
-    input_data = json.load(sys.stdin)
+    try:
+        input_data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"Hook input invalid: {e}", file=sys.stderr)
+        sys.exit(2)
 
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
@@ -470,6 +494,12 @@ def main():
         # Check both new content being written and the file path
         text_to_check = tool_input.get("content", "")
         text_to_check += "\n" + tool_input.get("new_string", "")
+    elif tool_name == "MultiEdit":
+        # MultiEdit applies a list of {old_string, new_string} edits to a file.
+        # Scan every new_string (and any 'content' field if present).
+        text_to_check = tool_input.get("content", "")
+        for edit in tool_input.get("edits", []) or []:
+            text_to_check += "\n" + edit.get("new_string", "")
     elif tool_name == "NotebookEdit":
         text_to_check = tool_input.get("new_source", "")
     elif tool_name in ("Read", "Grep", "Glob"):
@@ -504,6 +534,86 @@ if __name__ == "__main__":
     main()
 HOOK_ENV_EXFIL
 
+# Write prevent-claude-tamper.py hook
+# Catches Bash-level attempts to overwrite, delete, or chmod files under
+# ~/.claude/ — the deny rules cover Edit/Write tools, but Bash redirection
+# (echo > ..., tee, sed -i, cp, rm, chmod, python -c "open(...,'w')", etc.)
+# is a separate path that this hook closes.
+cat > "$HOOKS_DIR/prevent-claude-tamper.py" << 'HOOK_TAMPER'
+#!/usr/bin/env python3
+"""
+PreToolUse hook to prevent tampering with ~/.claude/ via Bash.
+
+Without this, Edit/Write deny rules on the hooks and settings.json can
+be bypassed by issuing the equivalent operation through a shell command
+(redirect, tee, cp, mv, sed -i, python -c, rm, chmod, etc.).
+
+Exit codes:
+- 0: Allow the action
+- 2: Block the action
+"""
+
+import json
+import sys
+import re
+
+# Matches any reference to ~/.claude/ or .claude/ in any reasonable form.
+CLAUDE_PATH = r"""(?:~/|\$HOME/|\$\{HOME\}/|/Users/[^/\s'"]+/|/home/[^/\s'"]+/)?\.claude/"""
+
+TAMPER_PATTERNS = [
+    # Output redirection ( > or >> ) into .claude/
+    rf">>?\s*['\"]?{CLAUDE_PATH}",
+    # tee writes
+    rf"\btee\b\s+(?:-\w+\s+)*['\"]?{CLAUDE_PATH}",
+    # File copy / move / link / install / rsync touching .claude/
+    rf"\b(?:cp|mv|install|rsync|ln)\b[^\n]*?{CLAUDE_PATH}",
+    # In-place edit with sed/perl
+    rf"\bsed\b\s+(?:-\w+\s+)*-i\b[^\n]*{CLAUDE_PATH}",
+    rf"\bperl\b\s+(?:-\w+\s+)*-i\b[^\n]*{CLAUDE_PATH}",
+    # Inline scripts that open .claude/* for writing
+    rf"(?:python[23]?|perl|ruby|node|php)[^\n]*open\s*\([^)]*{CLAUDE_PATH}",
+    rf"(?:python[23]?|perl|ruby|node|php)[^\n]*[wW]riteFile[^\n]*{CLAUDE_PATH}",
+    # Removal / truncation / overwrite
+    rf"\brm\b[^\n]*{CLAUDE_PATH}",
+    rf"\btruncate\b[^\n]*{CLAUDE_PATH}",
+    rf"\bdd\b[^\n]*\bof=[^\s]*{CLAUDE_PATH}",
+    # Make hooks non-executable / writable / change owner
+    rf"\bchmod\b[^\n]*{CLAUDE_PATH}",
+    rf"\bchown\b[^\n]*{CLAUDE_PATH}",
+]
+
+
+def main():
+    try:
+        input_data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"Hook input invalid: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if input_data.get("tool_name") != "Bash":
+        sys.exit(0)
+
+    command = input_data.get("tool_input", {}).get("command", "")
+    if not command:
+        sys.exit(0)
+
+    for pattern in TAMPER_PATTERNS:
+        if re.search(pattern, command):
+            print("Blocked: modification of ~/.claude/ via Bash is not allowed.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("This protects the hook files and settings from being", file=sys.stderr)
+            print("disabled or rewritten through shell commands. If you", file=sys.stderr)
+            print("really need to change them, run the command yourself", file=sys.stderr)
+            print("with the ! prefix.", file=sys.stderr)
+            sys.exit(2)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+HOOK_TAMPER
+
 for hook in "${HOOK_FILES[@]}"; do
   chmod +x "$hook"
   echo "Wrote $hook (executable)"
@@ -519,3 +629,4 @@ echo "  - Sensitive file read blocking (permissions.deny)"
 echo "  - Destructive command blocking (security-validator.py + permissions.deny)"
 echo "  - Git force push prevention (prevent-force-push.py)"
 echo "  - .env exfiltration prevention (prevent-env-exfil.py)"
+echo "  - ~/.claude/ tamper prevention (prevent-claude-tamper.py)"

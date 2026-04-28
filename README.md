@@ -29,13 +29,14 @@ Both scripts are idempotent — safe to run multiple times. Only the rules added
 - Terraform state, git credentials, and more
 - Privilege escalation (`sudo`, `su`)
 - Destructive commands (`shred`, `unlink`, `git rm`, `git clean`, `git push --force*`, `git reset --hard*`)
-- Self-protection: prevents Claude from editing the hooks or `~/.claude/settings.json`
+- Self-protection: prevents Claude from editing the hooks or `~/.claude/settings.json`, and from rewriting them via Bash (`>`, `tee`, `cp`, `rm`, `chmod`, …)
 
 **Hooks** (in `~/.claude/hooks/`) — catch what permission rules miss:
 
 - `security-validator.py` — blocks destructive `rm` targeting root (`/`) or home (`~`) level paths
 - `prevent-force-push.py` — blocks `git push --force`, `git push -f`, and `git push --force-with-lease`
 - `prevent-env-exfil.py` — blocks 60+ `.env` exfiltration patterns (direct reads, copies, archives, network exfil, environment dumping, inline script tricks) while still allowing Claude to write source code that uses `load_dotenv()` at runtime
+- `prevent-claude-tamper.py` — blocks Bash-level writes, deletes, and `chmod` against anything under `~/.claude/`, so the hooks and settings can't be disabled with a shell redirect
 
 ## How `.env` access works
 
