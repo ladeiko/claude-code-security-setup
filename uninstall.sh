@@ -120,7 +120,11 @@ deny_rules = {
     'Read(**/.mcp.json)',
     # Privilege escalation / destructive Bash
     'Bash(sudo *)',
+    'Bash(/usr/bin/sudo *)',
+    'Bash(/bin/sudo *)',
     'Bash(su *)',
+    'Bash(/usr/bin/su *)',
+    'Bash(/bin/su *)',
     'Bash(shred *)',
     'Bash(unlink *)',
     # Git destructive
@@ -129,6 +133,14 @@ deny_rules = {
     'Bash(git clean *)',
     'Bash(git push --force*)',
     'Bash(git reset --hard*)',
+    # git -C <dir> bypasses
+    'Bash(git -C * rm *)',
+    'Bash(git -C * clean *)',
+    'Bash(git -C * push --force*)',
+    'Bash(git -C * reset --hard*)',
+    # +refspec force pushes
+    'Bash(git push * +*:*)',
+    'Bash(git push +*:*)',
     # .env exfil shorthand
     'Bash(cat .env*)',
     'Bash(cat */.env*)',

@@ -9,7 +9,7 @@ PASSED=0
 FAILED=0
 
 # Total deny rules added by the installer (keep in sync with install.sh).
-DENY_RULE_COUNT=70
+DENY_RULE_COUNT=80
 # Total PreToolUse hook entries added by the installer.
 HOOK_ENTRY_COUNT=4
 
@@ -307,28 +307,105 @@ setup
 teardown
 
 echo ""
-echo "=== Test 10: security-validator blocks rm at root/home ==="
+echo "=== Test 10: security-validator blocks destructive patterns ==="
 setup
   bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
   HOOK="$FAKE_HOME/.claude/hooks/security-validator.py"
 
+  # Original root/home cases
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}')
-  assert_eq "rm -rf / blocked (exit 2)" "exit:2" "$result"
+  assert_eq "rm -rf / blocked" "exit:2" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm /*"}}')
-  assert_eq "rm /* blocked (exit 2)" "exit:2" "$result"
+  assert_eq "rm /* blocked" "exit:2" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -r ~/"}}')
-  assert_eq "rm -r ~/ blocked (exit 2)" "exit:2" "$result"
+  assert_eq "rm -r ~/ blocked" "exit:2" "$result"
 
+  # System dirs
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf /etc"}}')
+  assert_eq "rm -rf /etc blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf /usr/local"}}')
+  assert_eq "rm -rf /usr/local blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf /var/log"}}')
+  assert_eq "rm -rf /var/log blocked" "exit:2" "$result"
+
+  # $HOME variants
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf $HOME"}}')
+  assert_eq "rm -rf \$HOME blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf ${HOME}/Documents"}}')
+  assert_eq "rm -rf \${HOME}/Documents blocked" "exit:2" "$result"
+
+  # Bare . / * (covers `cd / && rm -rf .` style bypass)
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cd / && rm -rf ."}}')
+  assert_eq "cd / && rm -rf . blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cd ~ && rm -rf *"}}')
+  assert_eq "cd ~ && rm -rf * blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf ."}}')
+  assert_eq "rm -rf . blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf *"}}')
+  assert_eq "rm -rf * blocked" "exit:2" "$result"
+
+  # find -delete / -exec rm
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"find / -name foo -delete"}}')
+  assert_eq "find / -delete blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"find ~ -name foo -delete"}}')
+  assert_eq "find ~ -delete blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"find /etc -exec rm {} ;"}}')
+  assert_eq "find /etc -exec rm blocked" "exit:2" "$result"
+
+  # rsync --delete to root/home
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rsync -av --delete /tmp/empty/ /"}}')
+  assert_eq "rsync --delete to / blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rsync -av --delete src/ ~/"}}')
+  assert_eq "rsync --delete to ~/ blocked" "exit:2" "$result"
+
+  # Recursive chmod / chown
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"chmod -R 777 /"}}')
+  assert_eq "chmod -R / blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"chmod -R 777 /etc"}}')
+  assert_eq "chmod -R /etc blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"chown -R user ~/"}}')
+  assert_eq "chown -R ~/ blocked" "exit:2" "$result"
+
+  # Allow cases — must NOT trigger
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf ./build"}}')
-  assert_eq "rm -rf ./build allowed (exit 0)" "exit:0" "$result"
+  assert_eq "rm -rf ./build allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf .git"}}')
+  assert_eq "rm -rf .git allowed (filename, not standalone .)" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf node_modules"}}')
+  assert_eq "rm -rf node_modules allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf *.tmp"}}')
+  assert_eq "rm -rf *.tmp allowed (* not standalone)" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"find . -name foo -delete"}}')
+  assert_eq "find . -delete allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"find /tmp -name foo -delete"}}')
+  assert_eq "find /tmp -delete allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"chmod -R 755 /tmp/foo"}}')
+  assert_eq "chmod -R /tmp/foo allowed" "exit:0" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}')
-  assert_eq "ls -la allowed (exit 0)" "exit:0" "$result"
+  assert_eq "ls -la allowed" "exit:0" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Read","tool_input":{"file":"/etc/passwd"}}')
-  assert_eq "non-Bash tool allowed (exit 0)" "exit:0" "$result"
+  assert_eq "non-Bash tool allowed" "exit:0" "$result"
 teardown
 
 echo ""
@@ -338,22 +415,40 @@ setup
   HOOK="$FAKE_HOME/.claude/hooks/prevent-force-push.py"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}')
-  assert_eq "git push --force blocked (exit 2)" "exit:2" "$result"
+  assert_eq "git push --force blocked" "exit:2" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git push -f origin main"}}')
-  assert_eq "git push -f blocked (exit 2)" "exit:2" "$result"
+  assert_eq "git push -f blocked" "exit:2" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git push --force-with-lease origin main"}}')
-  assert_eq "git push --force-with-lease blocked (exit 2)" "exit:2" "$result"
+  assert_eq "git push --force-with-lease blocked" "exit:2" "$result"
 
+  # New: git -c <kv> push --force should be normalized and blocked
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git -c push.default=current push --force origin main"}}')
+  assert_eq "git -c <kv> push --force blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git -c http.proxy=x -c core.pager=less push -f origin main"}}')
+  assert_eq "multiple -c then push -f blocked" "exit:2" "$result"
+
+  # New: +refspec force pushes
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git push origin +main:main"}}')
+  assert_eq "git push origin +main:main blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git push origin +HEAD:refs/heads/main"}}')
+  assert_eq "git push origin +HEAD:refs/heads/main blocked" "exit:2" "$result"
+
+  # Allow cases
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}')
-  assert_eq "git push (normal) allowed (exit 0)" "exit:0" "$result"
+  assert_eq "git push (normal) allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git -c http.proxy=x push origin main"}}')
+  assert_eq "git -c <kv> push (normal) allowed" "exit:0" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"git status"}}')
-  assert_eq "git status allowed (exit 0)" "exit:0" "$result"
+  assert_eq "git status allowed" "exit:0" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Read","tool_input":{"file":"README.md"}}')
-  assert_eq "non-Bash tool allowed (exit 0)" "exit:0" "$result"
+  assert_eq "non-Bash tool allowed" "exit:0" "$result"
 teardown
 
 echo ""
@@ -384,6 +479,56 @@ setup
 
   result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"content":"from dotenv import load_dotenv\nload_dotenv()"}}')
   assert_eq "Write load_dotenv source allowed (exit 0)" "exit:0" "$result"
+
+  # New readers / metadata leaks
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"od -c .env"}}')
+  assert_eq "od .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"hexdump .env"}}')
+  assert_eq "hexdump .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"paste .env"}}')
+  assert_eq "paste .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cut -d= -f2 .env"}}')
+  assert_eq "cut .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"jq -Rs . .env"}}')
+  assert_eq "jq .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"nl .env"}}')
+  assert_eq "nl .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"wc -l .env"}}')
+  assert_eq "wc .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"stat .env"}}')
+  assert_eq "stat .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"md5sum .env"}}')
+  assert_eq "md5sum .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"sha256sum .env"}}')
+  assert_eq "sha256sum .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"openssl dgst -sha256 .env"}}')
+  assert_eq "openssl dgst .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"bzip2 -k .env"}}')
+  assert_eq "bzip2 .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"xz -k .env"}}')
+  assert_eq "xz .env blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"7z a stolen.7z .env"}}')
+  assert_eq "7z .env blocked" "exit:2" "$result"
+
+  # subprocess / argv-style bypass
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"content":"import subprocess\nsubprocess.run([\"cat\", \".env\"])"}}')
+  assert_eq "Write subprocess.run([cat,.env]) blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"content":"os.execvp(\"cat\", [\"/bin/cat\", \".env\"])"}}')
+  assert_eq "Write argv list with /bin/cat .env blocked" "exit:2" "$result"
 
   # Benign cases
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}')

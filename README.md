@@ -33,9 +33,9 @@ Both scripts are idempotent — safe to run multiple times. Only the rules added
 
 **Hooks** (in `~/.claude/hooks/`) — catch what permission rules miss:
 
-- `security-validator.py` — blocks destructive `rm` targeting root (`/`) or home (`~`) level paths
-- `prevent-force-push.py` — blocks `git push --force`, `git push -f`, and `git push --force-with-lease`
-- `prevent-env-exfil.py` — blocks 60+ `.env` exfiltration patterns (direct reads, copies, archives, network exfil, environment dumping, inline script tricks) while still allowing Claude to write source code that uses `load_dotenv()` at runtime
+- `security-validator.py` — blocks destructive commands: `rm` against root / home / `$HOME` / system dirs (`/etc`, `/var`, `/usr`, `/bin`, `/sbin`, `/lib`, `/opt`, `/boot`, `/root`, `/private`, `/System`, `/Library`), bare `rm .` / `rm *`, `find / -delete` / `find / -exec rm`, `rsync --delete /`, and recursive `chmod`/`chown` against the same paths
+- `prevent-force-push.py` — blocks `git push --force`, `-f`, `--force-with-lease`, and `+refspec` (`git push origin +main:main`); normalizes `git -c key=val push …` so config flags can't disguise the push
+- `prevent-env-exfil.py` — blocks 80+ `.env` exfiltration patterns (direct reads, copies, archives, network exfil, environment dumping, inline script tricks, `subprocess` argv-style `['cat', '.env']`, hash/metadata leaks via `md5sum`/`stat`/`wc`, etc.) while still allowing Claude to write source code that uses `load_dotenv()` at runtime
 - `prevent-claude-tamper.py` — blocks Bash-level writes, deletes, and `chmod` against anything under `~/.claude/`, so the hooks and settings can't be disabled with a shell redirect
 
 ## How `.env` access works

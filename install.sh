@@ -132,7 +132,11 @@ deny_rules = [
     'Read(**/.mcp.json)',
     # Privilege escalation / destructive Bash
     'Bash(sudo *)',
+    'Bash(/usr/bin/sudo *)',
+    'Bash(/bin/sudo *)',
     'Bash(su *)',
+    'Bash(/usr/bin/su *)',
+    'Bash(/bin/su *)',
     'Bash(shred *)',
     'Bash(unlink *)',
     # Git destructive
@@ -141,6 +145,14 @@ deny_rules = [
     'Bash(git clean *)',
     'Bash(git push --force*)',
     'Bash(git reset --hard*)',
+    # git -C <dir> bypasses (covers `git -C /tmp rm -rf *`, etc.)
+    'Bash(git -C * rm *)',
+    'Bash(git -C * clean *)',
+    'Bash(git -C * push --force*)',
+    'Bash(git -C * reset --hard*)',
+    # +refspec force pushes (covers `git push origin +main:main`)
+    'Bash(git push * +*:*)',
+    'Bash(git push +*:*)',
     # .env exfil shorthand (extra layer alongside prevent-env-exfil.py)
     'Bash(cat .env*)',
     'Bash(cat */.env*)',
@@ -221,23 +233,52 @@ cat > "$HOOKS_DIR/security-validator.py" << 'HOOK_SECURITY_VALIDATOR'
 
 """
 Security validator hook for Claude Code.
-Blocks destructive commands like 'rm -rf'.
-For file access blocking, use permissions.deny in settings.json instead.
+Blocks destructive commands like 'rm -rf' and recursive chmod/chown
+against root, home, or system directories. For file access blocking,
+use permissions.deny in settings.json instead.
 """
 
 import json
 import sys
 import re
 
-def check_bash_command(command: str) -> tuple[bool, str]:
-    """
-    Validate bash commands for dangerous patterns.
-    Returns: (is_allowed, error_message)
-    """
-    # Block rm targeting root (/) or home (~) directly
-    if re.search(r'\brm\s+(-[a-zA-Z]*\s+)*(/$|/\s|/\*|~/|~\s|~$)', command):
-        return False, "rm at root/home level is blocked. Use explicit paths in safe locations."
+# Known-dangerous system directory roots.
+DANGEROUS_SYS = r"(?:/etc|/var|/usr|/bin|/sbin|/lib|/opt|/boot|/root|/private|/System|/Library)"
 
+CHECKS = [
+    # rm against root, home, $HOME, or system dirs
+    (
+        rf"\brm\s+(?:-[a-zA-Z]*\s+)*(?:/$|/\s|/\*|~/|~\s|~$|\$HOME\b|\$\{{HOME\}}|{DANGEROUS_SYS}\b)",
+        "rm against root/home/system directories is blocked.",
+    ),
+    # rm of a bare '.' or '*' argument — almost always catastrophic in some cwd
+    (
+        r"\brm\s+(?:[^\n]*?\s)?(?:\.|\*)(?:\s|$|;|&|\|)",
+        "rm of bare '.' or '*' is blocked. Use explicit paths.",
+    ),
+    # find -delete or -exec rm rooted at /, ~, or a system dir
+    (
+        rf"\bfind\s+(?:/(?:\s|$)|~(?:/|\s|$)|{DANGEROUS_SYS}\b)[^\n]*?(?:-delete\b|-exec\s+(?:rm|unlink)\b)",
+        "find -delete or -exec rm against root/home/system is blocked.",
+    ),
+    # rsync --delete with a / or ~ destination
+    (
+        r"\brsync\b[^\n]*?--delete\b[^\n]*?\s(?:/(?:\s|$)|~(?:/|\s|$))",
+        "rsync --delete against root/home is blocked.",
+    ),
+    # Recursive chmod/chown against root/home/system
+    (
+        rf"\b(?:chmod|chown)\s+(?:-\w*R\w*|-R|--recursive)\b[^\n]*?\s(?:/(?:\s|$)|~(?:/|\s|$)|{DANGEROUS_SYS}\b)",
+        "recursive chmod/chown against root/home/system is blocked.",
+    ),
+]
+
+
+def check_bash_command(command: str) -> tuple[bool, str]:
+    """Return (is_allowed, error_message) for a Bash command."""
+    for pattern, message in CHECKS:
+        if re.search(pattern, command):
+            return False, message
     return True, ""
 
 def main():
@@ -307,15 +348,21 @@ def main():
     if tool_name != "Bash":
         sys.exit(0)
 
+    # Normalize 'git -c key=value -c k=v push ...' down to 'git push ...'
+    # so per-invocation config flags can't hide the push command.
+    normalized = re.sub(r"\bgit\s+(?:-c\s+\S+\s+)+", "git ", command)
+
     # Check for force push patterns
     force_push_patterns = [
         r'\bgit\s+push\s+.*--force\b',
         r'\bgit\s+push\s+.*-f\b',
-        r'\bgit\s+push\s+.*--force-with-lease\b'
+        r'\bgit\s+push\s+.*--force-with-lease\b',
+        # +refspec (e.g. 'git push origin +main:main') forces a non-FF push.
+        r'\bgit\s+push\s+(?:\S+\s+)*\+\S+:',
     ]
 
     for pattern in force_push_patterns:
-        if re.search(pattern, command):
+        if re.search(pattern, normalized):
             print("Force push is not permitted.", file=sys.stderr)
             print("", file=sys.stderr)
             print("Force pushing can overwrite history and cause data loss.", file=sys.stderr)
@@ -418,6 +465,39 @@ DIRECT_ACCESS_PATTERNS = [
       r"""wget.*\.env""",
       r"""\bnc\s+.*\.env""",
       r"""\bnetcat\s+.*\.env""",
+
+      # === Additional readers / metadata leaks ===
+      r"""\bod\s+.*\.env""",
+      r"""\bhexdump\s+.*\.env""",
+      r"""\bpaste\s+.*\.env""",
+      r"""\bcut\s+.*\.env""",
+      r"""\bcolumn\s+.*\.env""",
+      r"""\bpr\s+.*\.env""",
+      r"""\bjq\s+.*\.env""",
+      r"""\byq\s+.*\.env""",
+      r"""\bnl\s+.*\.env""",
+      r"""\bed\s+.*\.env""",
+      r"""\bex\s+.*\.env""",
+      r"""\bview\s+.*\.env""",
+      r"""\bwc\s+.*\.env""",
+      r"""\bdu\s+.*\.env""",
+      r"""\bstat\s+.*\.env""",
+      r"""\bmd5sum\s+.*\.env""",
+      r"""\bsha\d+sum\s+.*\.env""",
+      r"""\bopenssl\s+.*\.env""",
+      r"""\bmapfile\s+.*\.env""",
+      r"""\breadarray\s+.*\.env""",
+      r"""\blink\s+.*\.env""",
+
+      # === Additional compression / archive ===
+      r"""\bbzip2\s+.*\.env""",
+      r"""\bxz\s+.*\.env""",
+      r"""\blzma\s+.*\.env""",
+      r"""\b7z\s+.*\.env""",
+      r"""\bzstd\s+.*\.env""",
+
+      # === subprocess argv-style: ['cat', '.env'] / ['/bin/cat', '.env'] ===
+      r"""\[\s*['"](?:/[^'"\s]+/)?(?:cat|head|tail|less|more|grep|awk|sed|od|hexdump|xxd|wc|stat|md5sum)['"][^\]]*?['"]\.env""",
 
       # === Find + exec patterns ===
       r"""\bfind\s+.*\.env""",
