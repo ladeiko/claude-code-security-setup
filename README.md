@@ -37,6 +37,7 @@ Both scripts are idempotent — safe to run multiple times. Only the rules added
 - `prevent-force-push.py` — blocks `git push --force`, `-f`, `--force-with-lease`, and `+refspec` (`git push origin +main:main`); normalizes `git -c key=val push …` so config flags can't disguise the push
 - `prevent-env-exfil.py` — blocks 80+ `.env` exfiltration patterns (direct reads, copies, archives, network exfil, environment dumping, inline script tricks, `subprocess` argv-style `['cat', '.env']`, hash/metadata leaks via `md5sum`/`stat`/`wc`, etc.) while still allowing Claude to write source code that uses `load_dotenv()` at runtime
 - `prevent-claude-tamper.py` — blocks Bash-level writes, deletes, and `chmod` against anything under `~/.claude/`, so the hooks and settings can't be disabled with a shell redirect
+- `prevent-secret-print.py` — when Claude tries to run `python3 foo.py` / `node foo.js` / `ruby foo.rb` / etc., reads the script and blocks if it prints, logs, or transmits `os.environ` / `process.env` / `ENV[…]` / `$_ENV` verbatim — closes the obvious "use `load_dotenv()` then `print(secret)`" exfiltration path that env-exfil intentionally allows in source code
 
 ## How `.env` access works
 
@@ -53,6 +54,15 @@ This lets Claude write a script using `load_dotenv()` and run it as `python3 scr
 - Only missing deny rules and hooks are appended; existing settings are preserved
 - The uninstall script removes only what the installer added
 - A backup of `settings.json` and any pre-existing hook files is held during install/uninstall, and restored automatically on failure
+
+## Limitations
+
+These hooks raise the bar against accidental misuse and casual prompt-injection. They do **not** stop a determined attacker that the user blindly approves. Specifically:
+
+- **Encoded / obfuscated execution** — `base64 -d`, `eval`, `xxd -r`, and `bash -c "$(…)"` are denied at the permission layer, but variable indirection (`f=cat; $f .env`), command substitution chains, and network-piped scripts can still slip through. Always read the command Claude wants to run before approving it.
+- **Side-channel exfil** — a script can still send secrets over HTTP without ever printing them, write them to a temp file, or leak partial info via hashes / line counts. `prevent-secret-print.py` catches the obvious patterns; it cannot catch every exfil shape.
+- **Human approval is the last line** — when in doubt, deny the prompt and ask Claude to explain. Don't run scripts you haven't read.
+- **Production secrets do not belong in `.env`** — use a secrets manager. These hooks protect dev-time `.env` files from casual exposure, not from a compromised dev machine.
 
 ## Requirements
 

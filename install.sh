@@ -15,6 +15,7 @@ HOOK_FILES=(
   "$HOOKS_DIR/prevent-force-push.py"
   "$HOOKS_DIR/prevent-env-exfil.py"
   "$HOOKS_DIR/prevent-claude-tamper.py"
+  "$HOOKS_DIR/prevent-secret-print.py"
 )
 
 # Temporary backup directory under $HOME (mode 700) — keeps secrets/settings
@@ -158,6 +159,17 @@ deny_rules = [
     # +refspec force pushes (covers `git push origin +main:main`)
     'Bash(git push * +*:*)',
     'Bash(git push +*:*)',
+    # Encoded / dynamic execution (Phase 4 — partial mitigation; cannot
+    # cover every base64/eval/curl|sh permutation, but raises the bar)
+    'Bash(eval *)',
+    'Bash(base64 -d*)',
+    'Bash(base64 --decode*)',
+    'Bash(xxd -r*)',
+    'Bash(* | *sh)',
+    'Bash(* |*sh)',
+    'Bash(bash -c *$(*)*)',
+    'Bash(sh -c *$(*)*)',
+    'Bash(zsh -c *$(*)*)',
     # .env exfil shorthand (extra layer alongside prevent-env-exfil.py)
     'Bash(cat .env*)',
     'Bash(cat */.env*)',
@@ -173,6 +185,8 @@ deny_rules = [
     'Write(~/.claude/hooks/prevent-env-exfil.py)',
     'Edit(~/.claude/hooks/prevent-claude-tamper.py)',
     'Write(~/.claude/hooks/prevent-claude-tamper.py)',
+    'Edit(~/.claude/hooks/prevent-secret-print.py)',
+    'Write(~/.claude/hooks/prevent-secret-print.py)',
     # Self-protection: Bash-level tampering with ~/.claude/
     # (prevent-claude-tamper.py is the comprehensive backstop; these
     # deny rules give a fast-fail at the permission layer.)
@@ -210,6 +224,10 @@ hook_entries = [
     {
         'matcher': 'Bash|Edit|MultiEdit|Write|NotebookEdit|Read|Grep|Glob',
         'hooks': [{'type': 'command', 'command': '~/.claude/hooks/prevent-env-exfil.py'}]
+    },
+    {
+        'matcher': 'Bash',
+        'hooks': [{'type': 'command', 'command': '~/.claude/hooks/prevent-secret-print.py'}]
     },
 ]
 
@@ -699,6 +717,124 @@ if __name__ == "__main__":
     main()
 HOOK_TAMPER
 
+# Write prevent-secret-print.py hook
+# When Claude tries to run an interpreter against a script file
+# (python3 foo.py, node bar.js, etc.), this hook reads the script
+# and blocks if it prints/logs/transmits env vars verbatim. This is
+# the load_dotenv-then-print exfil path that prevent-env-exfil
+# intentionally allows in source code: env-exfil lets you write
+# load_dotenv()/os.environ in a file, this hook stops you running
+# a file that would dump those values.
+cat > "$HOOKS_DIR/prevent-secret-print.py" << 'HOOK_SECRET_PRINT'
+#!/usr/bin/env python3
+"""
+PreToolUse hook: when Claude runs a script (python3 foo.py, node
+bar.js, etc.), read the script and block if it obviously prints,
+logs, or transmits environment variables verbatim.
+
+Caveats — this is a partial mitigation, not a full solution:
+- Inspects only one script at a time, no import following.
+- Doesn't catch obfuscated exfil (echo $SECRET, HTTP body, base64).
+- A 'cd subdir && python3 main.py' resolves main.py against the
+  hook's cwd, which may differ from the shell's resulting cwd.
+- The intent is to make the obvious 'load_dotenv() + print' path
+  fail loudly so a human notices, not to defeat a determined
+  attacker. Always review generated scripts before approving them.
+
+Exit codes:
+- 0: Allow
+- 2: Block
+"""
+
+import json
+import sys
+import re
+import os
+
+INTERPRETER_RE = re.compile(
+    r"""
+    \b(?P<interp>python3?|node|nodejs|ruby|perl|php|deno|bun)
+    (?:\s+(?:-[a-zA-Z]\S*|--\S+))*           # optional leading flags
+    \s+
+    (?P<script>['"]?[^\s'"&|;<>]+\.(?:py|js|mjs|cjs|ts|tsx|rb|pl|pm|php)['"]?)
+    """,
+    re.VERBOSE,
+)
+
+# Patterns that look like printing/logging/transmitting env vars verbatim.
+SECRET_PRINT_PATTERNS = [
+    # Python: print/log/sys.stdout of os.environ / os.getenv
+    r"""print\s*\([^)]*\bos\.(?:environ|getenv)""",
+    r"""sys\.stdout\.write\s*\([^)]*\bos\.(?:environ|getenv)""",
+    r"""logging\.\w+\s*\([^)]*\bos\.(?:environ|getenv)""",
+    r"""json\.dumps?\s*\(\s*(?:dict\s*\(\s*)?os\.environ""",
+    # Python: HTTP send of os.environ
+    r"""requests\.\w+\s*\([^)]*\bos\.(?:environ|getenv)""",
+    r"""urlopen\s*\([^)]*\bos\.(?:environ|getenv)""",
+    r"""httpx\.\w+\s*\([^)]*\bos\.(?:environ|getenv)""",
+    # JS/TS: console / process.stdout / fetch / axios with process.env
+    r"""console\.\w+\s*\([^)]*\bprocess\.env""",
+    r"""process\.stdout\.write\s*\([^)]*\bprocess\.env""",
+    r"""JSON\.stringify\s*\(\s*process\.env""",
+    r"""fetch\s*\([^)]*\bprocess\.env""",
+    r"""axios\.\w+\s*\([^)]*\bprocess\.env""",
+    # Ruby: puts / p / print / pp ENV
+    r"""\b(?:puts|p|print|pp)\s+\(?ENV(?:\.|\[|\b)""",
+    # Perl: print/say $ENV{...}
+    r"""(?:print|say)\b[^;]*\$ENV\{""",
+    # PHP: echo $_ENV / $_SERVER
+    r"""echo\b[^;]*\$_(?:ENV|SERVER)\b""",
+]
+
+
+def main():
+    try:
+        input_data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"Hook input invalid: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if input_data.get("tool_name") != "Bash":
+        sys.exit(0)
+
+    tool_input = input_data.get("tool_input", {})
+    command = tool_input.get("command", "")
+    if not command:
+        sys.exit(0)
+
+    cwd = tool_input.get("cwd") or os.getcwd()
+
+    for match in INTERPRETER_RE.finditer(command):
+        script = match.group("script").strip("'\"")
+        if not script:
+            continue
+        path = script if os.path.isabs(script) else os.path.join(cwd, script)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            # Script not readable from here — let runtime decide.
+            continue
+        for pattern in SECRET_PRINT_PATTERNS:
+            if re.search(pattern, content):
+                print(
+                    f"Blocked: {script!r} appears to print or transmit "
+                    "environment variables verbatim.",
+                    file=sys.stderr,
+                )
+                print("", file=sys.stderr)
+                print("Edit the script to remove the env-secret print/log/", file=sys.stderr)
+                print("network call, or run it yourself with the ! prefix", file=sys.stderr)
+                print("after reviewing.", file=sys.stderr)
+                sys.exit(2)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+HOOK_SECRET_PRINT
+
 for hook in "${HOOK_FILES[@]}"; do
   chmod +x "$hook"
   echo "Wrote $hook (executable)"
@@ -715,3 +851,4 @@ echo "  - Destructive command blocking (security-validator.py + permissions.deny
 echo "  - Git force push prevention (prevent-force-push.py)"
 echo "  - .env exfiltration prevention (prevent-env-exfil.py)"
 echo "  - ~/.claude/ tamper prevention (prevent-claude-tamper.py)"
+echo "  - Script env-print prevention (prevent-secret-print.py)"

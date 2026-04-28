@@ -15,6 +15,7 @@ HOOK_FILES=(
   "$HOOKS_DIR/prevent-force-push.py"
   "$HOOKS_DIR/prevent-env-exfil.py"
   "$HOOKS_DIR/prevent-claude-tamper.py"
+  "$HOOKS_DIR/prevent-secret-print.py"
 )
 
 # Temporary backup directory under $HOME (mode 700) — keeps backups off
@@ -144,6 +145,16 @@ deny_rules = {
     # +refspec force pushes
     'Bash(git push * +*:*)',
     'Bash(git push +*:*)',
+    # Encoded / dynamic execution
+    'Bash(eval *)',
+    'Bash(base64 -d*)',
+    'Bash(base64 --decode*)',
+    'Bash(xxd -r*)',
+    'Bash(* | *sh)',
+    'Bash(* |*sh)',
+    'Bash(bash -c *$(*)*)',
+    'Bash(sh -c *$(*)*)',
+    'Bash(zsh -c *$(*)*)',
     # .env exfil shorthand
     'Bash(cat .env*)',
     'Bash(cat */.env*)',
@@ -159,6 +170,8 @@ deny_rules = {
     'Write(~/.claude/hooks/prevent-env-exfil.py)',
     'Edit(~/.claude/hooks/prevent-claude-tamper.py)',
     'Write(~/.claude/hooks/prevent-claude-tamper.py)',
+    'Edit(~/.claude/hooks/prevent-secret-print.py)',
+    'Write(~/.claude/hooks/prevent-secret-print.py)',
     # Self-protection: Bash-level tampering with ~/.claude/
     'Bash(rm ~/.claude/*)',
     'Bash(rm -rf ~/.claude*)',
@@ -185,6 +198,7 @@ managed_commands = {
     '~/.claude/hooks/prevent-force-push.py',
     '~/.claude/hooks/prevent-env-exfil.py',
     '~/.claude/hooks/prevent-claude-tamper.py',
+    '~/.claude/hooks/prevent-secret-print.py',
 }
 
 hooks = settings.get('hooks', {})
