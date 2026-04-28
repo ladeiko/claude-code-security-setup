@@ -1,6 +1,6 @@
 # Claude Code Security Setup
 
-Two-layer protection for sensitive files and destructive commands.
+Layered protection for sensitive files, secret exfiltration, and destructive commands.
 
 ## Quick install
 
@@ -18,25 +18,40 @@ Both scripts are idempotent — safe to run multiple times. Only the rules added
 
 ## What it does
 
-**permissions.deny** (in `~/.claude/settings.json`) — blocks Claude from reading sensitive files:
+**permissions.deny** (in `~/.claude/settings.json`) — blocks Claude at the permission layer:
 
-- `.env` files and variants
-- SSH keys, PEM/PFX/PPK certificates
-- Cloud credentials (AWS, Azure, GCloud)
-- Kubernetes and Docker configs
+- `.env` files and variants, plus `cat .env*` shortcuts
+- SSH keys (`id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `id_dsa*`), PEM/PFX/PPK certificates
+- Cloud credentials (AWS credentials & config, Azure, GCloud)
+- Kubernetes, Docker, and MCP configs
 - Database passwords (`.pgpass`, `.my.cnf`)
 - Shell history (`.bash_history`, `.zsh_history`)
 - Terraform state, git credentials, and more
+- Privilege escalation (`sudo`, `su`)
+- Destructive commands (`shred`, `unlink`, `git rm`, `git clean`, `git push --force*`, `git reset --hard*`)
+- Self-protection: prevents Claude from editing the hooks or `~/.claude/settings.json`
 
-**Hook** (`~/.claude/hooks/security-validator.py`) — blocks destructive Bash commands:
+**Hooks** (in `~/.claude/hooks/`) — catch what permission rules miss:
 
-- `rm` targeting root (`/`) or home (`~`) level paths
+- `security-validator.py` — blocks destructive `rm` targeting root (`/`) or home (`~`) level paths
+- `prevent-force-push.py` — blocks `git push --force`, `git push -f`, and `git push --force-with-lease`
+- `prevent-env-exfil.py` — blocks 60+ `.env` exfiltration patterns (direct reads, copies, archives, network exfil, environment dumping, inline script tricks) while still allowing Claude to write source code that uses `load_dotenv()` at runtime
+
+## How `.env` access works
+
+The env-exfil hook splits patterns into two layers:
+
+1. **Direct access** (blocked everywhere) — `cat .env`, `open('.env')`, `cp .env`, `source .env`, `curl ... .env`, `printenv`, `python3 -c '...'` with env references, etc.
+2. **Bash-only** (allowed in source code, blocked in shell) — `load_dotenv`, `import dotenv`, `dotenv.config()`, and `.env` filename string references.
+
+This lets Claude write a script using `load_dotenv()` and run it as `python3 script.py` — the secrets stay in the file and load at runtime, but Claude can't read them directly.
 
 ## How it works
 
 - The install script **merges** into your existing `~/.claude/settings.json` — it does not overwrite it
 - Only missing deny rules and hooks are appended; existing settings are preserved
-- A backup is saved to `~/.claude/settings.json.bak` before any changes
+- The uninstall script removes only what the installer added
+- A backup of `settings.json` and any pre-existing hook files is held during install/uninstall, and restored automatically on failure
 
 ## Requirements
 
@@ -47,6 +62,11 @@ Both scripts are idempotent — safe to run multiple times. Only the rules added
 
 [Siarhei Ladzeika](https://github.com/ladeiko)
 
-## Reference
+## References
 
-Based on the original gist by [@sgasser](https://github.com/sgasser): https://gist.github.com/sgasser/efeb186bad7e68c146d6692ec05c1a57
+- Original `permissions.deny` gist by [@sgasser](https://github.com/sgasser): https://gist.github.com/sgasser/efeb186bad7e68c146d6692ec05c1a57
+- `prevent-force-push.py` and `prevent-env-exfil.py` hooks by [@henryklunaris](https://github.com/henryklunaris): https://github.com/henryklunaris/claude-code-security
+
+## License
+
+[MIT](LICENSE)
