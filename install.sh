@@ -579,6 +579,38 @@ def check_patterns(text, patterns):
     return None
 
 
+def _normalize_bash(s):
+    """Approximate shell parsing to defeat trivial obfuscation:
+    line continuations, backslash escapes, and empty-quote-pair
+    concatenation tricks like `cat .e''nv` or `cat .e\\nv`."""
+    s = re.sub(r'\\\n', '', s)                         # line continuation
+    s = re.sub(r'\\(.)', r'\1', s, flags=re.DOTALL)     # \X -> X
+    s = re.sub(r"''|\"\"", '', s)                       # '' "" -> empty
+    return s
+
+
+def _brace_variants(s):
+    """Yield first-alt and last-alt brace expansions to catch
+    obfuscation like `cat .e{n,n}v` or `cat .{a,e}nv`. Not a full
+    Cartesian expansion — single-pass approximation only."""
+    first = re.sub(r'\{([^,{}]+)(?:,[^{}]+)+\}', r'\1', s)
+    last = re.sub(r'\{(?:[^,{}]+,)+([^,{}]+)\}', r'\1', s)
+    if first != s:
+        yield first
+    if last != s and last != first:
+        yield last
+
+
+def _bash_candidates(command):
+    """Yield original + normalized + brace-expansion variants, deduped."""
+    seen = set()
+    normalized = _normalize_bash(command)
+    for cand in (command, normalized, *_brace_variants(normalized)):
+        if cand not in seen:
+            seen.add(cand)
+            yield cand
+
+
 def main():
     try:
         input_data = json.load(sys.stdin)
@@ -589,46 +621,50 @@ def main():
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
 
-    text_to_check = ""
+    candidates = []
+    bash_check = False
 
     if tool_name == "Bash":
-        text_to_check = tool_input.get("command", "")
+        # Generate normalized + brace-expanded candidates so trivial
+        # shell obfuscation (\<nl>, \X, '', "", {a,b}) can't evade.
+        candidates = list(_bash_candidates(tool_input.get("command", "")))
+        bash_check = True
     elif tool_name in ("Edit", "Write"):
-        # Check both new content being written and the file path
-        text_to_check = tool_input.get("content", "")
-        text_to_check += "\n" + tool_input.get("new_string", "")
+        candidates = [
+            tool_input.get("content", "") + "\n" + tool_input.get("new_string", "")
+        ]
     elif tool_name == "MultiEdit":
-        # MultiEdit applies a list of {old_string, new_string} edits to a file.
-        # Scan every new_string (and any 'content' field if present).
-        text_to_check = tool_input.get("content", "")
+        # Scan every edits[].new_string + any 'content' field.
+        text = tool_input.get("content", "")
         for edit in tool_input.get("edits", []) or []:
-            text_to_check += "\n" + edit.get("new_string", "")
+            text += "\n" + edit.get("new_string", "")
+        candidates = [text]
     elif tool_name == "NotebookEdit":
-        text_to_check = tool_input.get("new_source", "")
+        candidates = [tool_input.get("new_source", "")]
     elif tool_name in ("Read", "Grep", "Glob"):
-        text_to_check = json.dumps(tool_input)
+        candidates = [json.dumps(tool_input)]
     else:
         sys.exit(0)
 
-    # Always check direct access patterns (all tools)
-    match = check_patterns(text_to_check, DIRECT_ACCESS_PATTERNS)
-    if match:
-        print("Blocked: direct .env file access is not allowed.", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("This hook prevents reading, copying, or directly accessing", file=sys.stderr)
-        print(".env files to protect secrets from exposure.", file=sys.stderr)
-        sys.exit(2)
+    # Always check direct access patterns (all tools, all candidates)
+    for cand in candidates:
+        if check_patterns(cand, DIRECT_ACCESS_PATTERNS):
+            print("Blocked: direct .env file access is not allowed.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("This hook prevents reading, copying, or directly accessing", file=sys.stderr)
+            print(".env files to protect secrets from exposure.", file=sys.stderr)
+            sys.exit(2)
 
     # Only check bash-only patterns for Bash (immediate execution)
-    if tool_name == "Bash":
-        match = check_patterns(text_to_check, BASH_ONLY_PATTERNS)
-        if match:
-            print("Blocked: running dotenv in a shell command is not allowed.", file=sys.stderr)
-            print("", file=sys.stderr)
-            print("You can write code that uses dotenv, but Claude cannot", file=sys.stderr)
-            print("execute it directly. Run the script yourself with:", file=sys.stderr)
-            print("  ! python3 your_script.py", file=sys.stderr)
-            sys.exit(2)
+    if bash_check:
+        for cand in candidates:
+            if check_patterns(cand, BASH_ONLY_PATTERNS):
+                print("Blocked: running dotenv in a shell command is not allowed.", file=sys.stderr)
+                print("", file=sys.stderr)
+                print("You can write code that uses dotenv, but Claude cannot", file=sys.stderr)
+                print("execute it directly. Run the script yourself with:", file=sys.stderr)
+                print("  ! python3 your_script.py", file=sys.stderr)
+                sys.exit(2)
 
     sys.exit(0)
 

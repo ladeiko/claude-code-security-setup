@@ -537,12 +537,35 @@ setup
   result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"content":"os.execvp(\"cat\", [\"/bin/cat\", \".env\"])"}}')
   assert_eq "Write argv list with /bin/cat .env blocked" "exit:2" "$result"
 
+  # Shell-obfuscation bypasses (closed by the normalization layer)
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat .e''nv"}}')
+  assert_eq "cat .e''nv blocked (empty-quote concat)" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat .e\\nv"}}')
+  assert_eq "cat .e\\nv blocked (backslash escape)" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat .e{n,n}v"}}')
+  assert_eq "cat .e{n,n}v blocked (brace expansion same)" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat .{a,e}nv"}}')
+  assert_eq "cat .{a,e}nv blocked (brace last-alt is .env)" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat .e{x,n}v"}}')
+  assert_eq "cat .e{x,n}v blocked (brace last-alt is .env)" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat \\\n.env"}}')
+  assert_eq "cat \\<newline>.env blocked (line continuation)" "exit:2" "$result"
+
   # Benign cases
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}')
   assert_eq "ls -la allowed (exit 0)" "exit:0" "$result"
 
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"python3 script.py"}}')
   assert_eq "python3 script.py allowed (exit 0)" "exit:0" "$result"
+
+  # Brace expansion in legitimate command — must NOT trigger
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cp foo.{txt,bak}"}}')
+  assert_eq "cp foo.{txt,bak} allowed" "exit:0" "$result"
 teardown
 
 echo ""
