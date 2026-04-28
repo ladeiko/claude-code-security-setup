@@ -6,6 +6,14 @@ set -euo pipefail
 #   - https://gist.github.com/sgasser/efeb186bad7e68c146d6692ec05c1a57
 #   - https://github.com/henryklunaris/claude-code-security
 
+# Verify python3 is available — hooks need it; if it's missing the install
+# would silently leave a half-broken setup whose hooks no-op at runtime.
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c '' >/dev/null 2>&1; then
+  echo "Error: python3 is required but not found or not runnable in PATH." >&2
+  echo "Install Python 3 (https://python.org) and re-run." >&2
+  exit 1
+fi
+
 CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
@@ -218,7 +226,7 @@ hook_entries = [
         'hooks': [{'type': 'command', 'command': '~/.claude/hooks/prevent-force-push.py'}]
     },
     {
-        'matcher': 'Bash',
+        'matcher': 'Bash|Edit|MultiEdit|Write|NotebookEdit',
         'hooks': [{'type': 'command', 'command': '~/.claude/hooks/prevent-claude-tamper.py'}]
     },
     {
@@ -307,9 +315,11 @@ def check_bash_command(command: str) -> tuple[bool, str]:
 def main():
     try:
         input_data = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
+        # Fail-closed: exit 2 so Claude Code blocks rather than silently
+        # allowing the call when a hook input is malformed.
         print(f"Error: Invalid JSON input: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
 
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
@@ -520,7 +530,13 @@ DIRECT_ACCESS_PATTERNS = [
       r"""\bzstd\s+.*\.env""",
 
       # === subprocess argv-style: ['cat', '.env'] / ['/bin/cat', '.env'] ===
-      r"""\[\s*['"](?:/[^'"\s]+/)?(?:cat|head|tail|less|more|grep|awk|sed|od|hexdump|xxd|wc|stat|md5sum)['"][^\]]*?['"]\.env""",
+      # Mirrors the shell-context reader catalog so authored scripts using
+      # subprocess.run([...]) can't bypass.
+      r"""\[\s*['"](?:/[^'"\s]+/)?(?:cat|head|tail|less|more|grep|awk|sed|od|hexdump|xxd|wc|du|stat|md5sum|sha\d*sum|paste|cut|column|pr|jq|yq|nl|ed|ex|view|file|mapfile|readarray|link|bzip2|xz|lzma|7z|zstd|tar|zip|gzip|cp|mv|ln|rsync|tee|dd|openssl|strings|base64)['"][^\]]*?['"]\.env""",
+      # Path concatenation tricks: '.' + 'env' / [".", "env"].join(".")
+      r"""['"]\.['"]\s*\+\s*['"]env['"]""",
+      r"""\[\s*['"]\.['"]\s*,\s*['"]env['"]\s*\][^.]*?\.\s*join""",
+      r"""\.\s*join\s*\(\s*\[\s*['"]\.['"]\s*,\s*['"]env['"]""",
 
       # === Find + exec patterns ===
       r"""\bfind\s+.*\.env""",
@@ -589,16 +605,29 @@ def _normalize_bash(s):
     return s
 
 
-def _brace_variants(s):
-    """Yield first-alt and last-alt brace expansions to catch
-    obfuscation like `cat .e{n,n}v` or `cat .{a,e}nv`. Not a full
-    Cartesian expansion — single-pass approximation only."""
-    first = re.sub(r'\{([^,{}]+)(?:,[^{}]+)+\}', r'\1', s)
-    last = re.sub(r'\{(?:[^,{}]+,)+([^,{}]+)\}', r'\1', s)
-    if first != s:
-        yield first
-    if last != s and last != first:
-        yield last
+def _brace_variants(s, _max_total=64):
+    """Yield brace expansions of `s`. Walks the innermost brace and
+    recurses on each comma-separated alternative, so nested braces like
+    `cat .{a,{e,x}}nv` produce `.anv`, `.env`, `.anv`, `.xnv` — and the
+    `.env` case is caught even though no single-pass first/last would.
+
+    Capped at `_max_total` distinct outputs to avoid pathological
+    inputs (`{a,b}{c,d}{e,f}...` is exponential)."""
+    seen = set()
+    stack = [s]
+    while stack and len(seen) < _max_total:
+        cur = stack.pop()
+        m = re.search(r'\{([^{}]*)\}', cur)
+        if not m:
+            if cur != s and cur not in seen:
+                seen.add(cur)
+                yield cur
+            continue
+        opts = m.group(1).split(',')
+        prefix = cur[:m.start()]
+        suffix = cur[m.end():]
+        for opt in opts:
+            stack.append(prefix + opt + suffix)
 
 
 def _bash_candidates(command):
@@ -681,45 +710,114 @@ HOOK_ENV_EXFIL
 cat > "$HOOKS_DIR/prevent-claude-tamper.py" << 'HOOK_TAMPER'
 #!/usr/bin/env python3
 """
-PreToolUse hook to prevent tampering with ~/.claude/ via Bash.
+PreToolUse hook: prevent tampering with ~/.claude/{settings,hooks/} via
+either Bash commands or authored source code that would shell-out to
+modify those paths at runtime.
 
-Without this, Edit/Write deny rules on the hooks and settings.json can
-be bypassed by issuing the equivalent operation through a shell command
-(redirect, tee, cp, mv, sed -i, python -c, rm, chmod, etc.).
+Two layers:
+
+1. Bash branch — broad. Any write/delete/chmod/redirect into anywhere
+   under ~/.claude/ is blocked. Catches direct shell tampering.
+
+2. Edit/Write/MultiEdit/NotebookEdit branch — narrow. Only blocks
+   writes to ~/.claude/settings*.json or ~/.claude/hooks/* (the auth-
+   bearing paths). Other ~/.claude/ subtrees (notably ~/.claude/projects/
+   used by the memory system, ~/.claude/agents/, ~/.claude/CLAUDE.md)
+   stay writable. The branch ALSO scans authored content for shell-out
+   patterns that would write to settings/hooks at runtime — closes the
+   "Claude writes a Python script that os.system()s into settings.json
+   then runs it" bypass.
 
 Exit codes:
-- 0: Allow the action
-- 2: Block the action
+- 0: Allow
+- 2: Block
 """
 
 import json
 import sys
 import re
 
-# Matches any reference to ~/.claude/ or .claude/ in any reasonable form.
-CLAUDE_PATH = r"""(?:~/|\$HOME/|\$\{HOME\}/|/Users/[^/\s'"]+/|/home/[^/\s'"]+/)?\.claude/"""
+# Path matchers. Lookbehind keeps `myfile.claude` (a file with .claude
+# extension) from triggering — only paths beginning .claude or with a
+# user-dir prefix qualify.
+_PATH_PREFIX = (
+    r"(?<![\w.-])"                                                     # not part of a longer identifier
+    r"(?:(?:~/|\$HOME/|\$\{HOME\}/|/Users/[^/\s'\"]+/|/home/[^/\s'\"]+/)?)"
+)
+# Broad: any ~/.claude/ or ~/.claude reference.
+CLAUDE_PATH_BROAD = _PATH_PREFIX + r"\.claude(?:/|\b)"
+# Narrow: only the auth-bearing paths (settings + hooks).
+CLAUDE_PATH_SENSITIVE = _PATH_PREFIX + r"\.claude/(?:settings(?:\.local)?\.json|hooks/)"
 
-TAMPER_PATTERNS = [
+# ---------------------------------------------------------------------
+# Bash patterns — broad. Any tamper of ~/.claude/* is blocked.
+# ---------------------------------------------------------------------
+BASH_TAMPER_PATTERNS = [
     # Output redirection ( > or >> ) into .claude/
-    rf">>?\s*['\"]?{CLAUDE_PATH}",
+    rf">>?\s*['\"]?{CLAUDE_PATH_BROAD}",
+    # Command substitution that resolves to a .claude/ path:
+    # `> $(echo ~/.claude/settings.json)` evades the literal redirect.
+    rf"\$\([^)]*{CLAUDE_PATH_BROAD}",
+    rf"`[^`]*{CLAUDE_PATH_BROAD}",
     # tee writes
-    rf"\btee\b\s+(?:-\w+\s+)*['\"]?{CLAUDE_PATH}",
+    rf"\btee\b\s+(?:-\w+\s+)*['\"]?{CLAUDE_PATH_BROAD}",
     # File copy / move / link / install / rsync touching .claude/
-    rf"\b(?:cp|mv|install|rsync|ln)\b[^\n]*?{CLAUDE_PATH}",
+    rf"\b(?:cp|mv|install|rsync|ln)\b[^\n]*?{CLAUDE_PATH_BROAD}",
     # In-place edit with sed/perl
-    rf"\bsed\b\s+(?:-\w+\s+)*-i\b[^\n]*{CLAUDE_PATH}",
-    rf"\bperl\b\s+(?:-\w+\s+)*-i\b[^\n]*{CLAUDE_PATH}",
+    rf"\bsed\b\s+(?:-\w+\s+)*-i\b[^\n]*{CLAUDE_PATH_BROAD}",
+    rf"\bperl\b\s+(?:-\w+\s+)*-i\b[^\n]*{CLAUDE_PATH_BROAD}",
     # Inline scripts that open .claude/* for writing
-    rf"(?:python[23]?|perl|ruby|node|php)[^\n]*open\s*\([^)]*{CLAUDE_PATH}",
-    rf"(?:python[23]?|perl|ruby|node|php)[^\n]*[wW]riteFile[^\n]*{CLAUDE_PATH}",
+    rf"(?:python[23]?|perl|ruby|node|php)[^\n]*open\s*\([^)]*{CLAUDE_PATH_BROAD}",
+    rf"(?:python[23]?|perl|ruby|node|php)[^\n]*[wW]riteFile[^\n]*{CLAUDE_PATH_BROAD}",
     # Removal / truncation / overwrite
-    rf"\brm\b[^\n]*{CLAUDE_PATH}",
-    rf"\btruncate\b[^\n]*{CLAUDE_PATH}",
-    rf"\bdd\b[^\n]*\bof=[^\s]*{CLAUDE_PATH}",
+    rf"\brm\b[^\n]*{CLAUDE_PATH_BROAD}",
+    rf"\btruncate\b[^\n]*{CLAUDE_PATH_BROAD}",
+    rf"\bdd\b[^\n]*\bof=[^\s]*{CLAUDE_PATH_BROAD}",
     # Make hooks non-executable / writable / change owner
-    rf"\bchmod\b[^\n]*{CLAUDE_PATH}",
-    rf"\bchown\b[^\n]*{CLAUDE_PATH}",
+    rf"\bchmod\b[^\n]*{CLAUDE_PATH_BROAD}",
+    rf"\bchown\b[^\n]*{CLAUDE_PATH_BROAD}",
 ]
+
+# ---------------------------------------------------------------------
+# Source-code patterns — narrow. Only flag write/delete contexts that
+# specifically target settings*.json or hooks/. Other .claude/ paths
+# (memory, agents, CLAUDE.md) are left writable.
+# ---------------------------------------------------------------------
+SOURCE_TAMPER_PATTERNS = [
+    # Python: open() with a write/append/update mode pointing at sensitive path
+    rf"open\s*\([^)]*?{CLAUDE_PATH_SENSITIVE}[^)]*?['\"][^'\"]*?[wa+][^'\"]*?['\"]",
+    # Python: standard library file ops (delete/rename/chmod/etc.)
+    rf"(?:os\.(?:remove|unlink|rmdir|rename|replace|chmod|chown|truncate)|shutil\.(?:copy(?:file|2|tree)?|move|rmtree))\s*\([^)]*?{CLAUDE_PATH_SENSITIVE}",
+    # pathlib.Path("...claude/...") — assume any reference is for write
+    rf"(?:pathlib\.)?Path\s*\([^)]*?{CLAUDE_PATH_SENSITIVE}",
+    # Shell-out from Python
+    rf"os\.system\s*\([^)]*?{CLAUDE_PATH_SENSITIVE}",
+    rf"subprocess\.(?:run|Popen|call|check_call|check_output)\s*\([^)]*?{CLAUDE_PATH_SENSITIVE}",
+    # Node.js fs (matches both `fs.writeFile(...)` and `require("fs").writeFile(...)` forms)
+    rf"\b(?:writeFile|writeFileSync|unlink|unlinkSync|rmSync|chmodSync|renameSync|truncateSync|appendFile|appendFileSync)\s*\([^)]*?{CLAUDE_PATH_SENSITIVE}",
+    # Node.js child_process
+    rf"\b(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*\([^)]*?{CLAUDE_PATH_SENSITIVE}",
+    # Bun / Deno write APIs
+    rf"(?:Bun|Deno)\.\w*[Ww]rite\w*\s*\([^)]*?{CLAUDE_PATH_SENSITIVE}",
+    # Generic shell-style command embedded in any quote style
+    rf"['\"`][^'\"`\n]*?(?:>\s*|>>\s*|\btee\b|\bcp\b|\bmv\b|\brm\b|\bchmod\b|\bsed\b\s+-i|\btruncate\b|\bdd\b\s+of=)[^'\"`\n]*?{CLAUDE_PATH_SENSITIVE}",
+]
+
+
+def _scan(patterns, text):
+    for p in patterns:
+        if re.search(p, text):
+            return p
+    return None
+
+
+def _block_and_exit(reason):
+    print(f"Blocked: {reason}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("This protects the hook files and ~/.claude/settings.json from", file=sys.stderr)
+    print("being disabled or rewritten. If you really need to change them,", file=sys.stderr)
+    print("run the command yourself with the ! prefix.", file=sys.stderr)
+    sys.exit(2)
 
 
 def main():
@@ -729,22 +827,42 @@ def main():
         print(f"Hook input invalid: {e}", file=sys.stderr)
         sys.exit(2)
 
-    if input_data.get("tool_name") != "Bash":
+    tool_name = input_data.get("tool_name", "")
+    tool_input = input_data.get("tool_input", {}) or {}
+
+    if tool_name == "Bash":
+        command = tool_input.get("command", "")
+        if not command:
+            sys.exit(0)
+        if _scan(BASH_TAMPER_PATTERNS, command):
+            _block_and_exit("modification of ~/.claude/ via Bash is not allowed.")
         sys.exit(0)
 
-    command = input_data.get("tool_input", {}).get("command", "")
-    if not command:
-        sys.exit(0)
+    if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        # 1) Block writes whose file_path/notebook_path is a sensitive ~/.claude/ path.
+        path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+        if path and re.search(CLAUDE_PATH_SENSITIVE, path):
+            _block_and_exit(
+                f"writing to {path!r} is not allowed (settings.json or a hook file)."
+            )
 
-    for pattern in TAMPER_PATTERNS:
-        if re.search(pattern, command):
-            print("Blocked: modification of ~/.claude/ via Bash is not allowed.", file=sys.stderr)
-            print("", file=sys.stderr)
-            print("This protects the hook files and settings from being", file=sys.stderr)
-            print("disabled or rewritten through shell commands. If you", file=sys.stderr)
-            print("really need to change them, run the command yourself", file=sys.stderr)
-            print("with the ! prefix.", file=sys.stderr)
-            sys.exit(2)
+        # 2) Block authored content that would shell-out to tamper at runtime.
+        content_parts = [
+            tool_input.get("content", ""),
+            tool_input.get("new_string", ""),
+            tool_input.get("new_source", ""),
+        ]
+        for edit in tool_input.get("edits", []) or []:
+            content_parts.append(edit.get("new_string", ""))
+        text = "\n".join(c for c in content_parts if c)
+
+        if text and _scan(SOURCE_TAMPER_PATTERNS, text):
+            _block_and_exit(
+                "authored content contains a runtime tamper of "
+                "~/.claude/{settings,hooks/}."
+            )
+
+        sys.exit(0)
 
     sys.exit(0)
 
@@ -789,13 +907,16 @@ import os
 
 INTERPRETER_RE = re.compile(
     r"""
-    \b(?P<interp>python3?|node|nodejs|ruby|perl|php|deno|bun)
+    \b(?P<interp>python3?|pypy3?|node|nodejs|ts-node|ruby|perl|php|deno|bun)
     (?:\s+(?:-[a-zA-Z]\S*|--\S+))*           # optional leading flags
     \s+
     (?P<script>['"]?[^\s'"&|;<>]+\.(?:py|js|mjs|cjs|ts|tsx|rb|pl|pm|php)['"]?)
     """,
     re.VERBOSE,
 )
+
+# Cap script reads so a giant file can't DoS the hook.
+_MAX_SCRIPT_BYTES = 1024 * 1024
 
 # Patterns that look like printing/logging/transmitting env vars verbatim.
 SECRET_PRINT_PATTERNS = [
@@ -847,7 +968,7 @@ def main():
         path = script if os.path.isabs(script) else os.path.join(cwd, script)
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                content = f.read()
+                content = f.read(_MAX_SCRIPT_BYTES)
         except OSError:
             # Script not readable from here — let runtime decide.
             continue

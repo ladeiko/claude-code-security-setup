@@ -556,6 +556,24 @@ setup
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat \\\n.env"}}')
   assert_eq "cat \\<newline>.env blocked (line continuation)" "exit:2" "$result"
 
+  # Nested brace expansion now collapses fully
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat .e{n,{x,n}}v"}}')
+  assert_eq "cat .e{n,{x,n}}v blocked (nested brace)" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"cat .{a,{e,x}}nv"}}')
+  assert_eq "cat .{a,{e,x}}nv blocked (nested brace, last alt of inner is .env)" "exit:2" "$result"
+
+  # Argv-list with extended reader (paste) — was bypass before, now caught
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"content":"import subprocess\nsubprocess.run([\"paste\", \".env\"])"}}')
+  assert_eq "Write subprocess argv [paste, .env] blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"content":"subprocess.run([\"/usr/bin/jq\", \"-Rs\", \".\", \".env\"])"}}')
+  assert_eq "Write subprocess argv [/usr/bin/jq, .env] blocked" "exit:2" "$result"
+
+  # Path concat: '.' + 'env'
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"content":"with open(\".\" + \"env\") as f: print(f.read())"}}')
+  assert_eq "Write open('.' + 'env') blocked (path concat)" "exit:2" "$result"
+
   # Benign cases
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}')
   assert_eq "ls -la allowed (exit 0)" "exit:0" "$result"
@@ -638,9 +656,76 @@ setup
   result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm /tmp/something"}}')
   assert_eq "rm /tmp/something allowed" "exit:0" "$result"
 
-  # Non-Bash tool — pass through
-  result=$(run_hook "$HOOK" '{"tool_name":"Edit","tool_input":{"file_path":"~/.claude/settings.json"}}')
-  assert_eq "non-Bash tool pass-through (exit 0)" "exit:0" "$result"
+  # New: command substitution evades literal redirect — must be blocked.
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"echo {} > $(echo ~/.claude/settings.json)"}}')
+  assert_eq "command-sub redirect to ~/.claude/ blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"echo {} > `echo ~/.claude/settings.json`"}}')
+  assert_eq "backtick-sub redirect to ~/.claude/ blocked" "exit:2" "$result"
+
+  # New: symlink redirect — `ln -s ~/.claude` (no trailing slash) now caught.
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"ln -s ~/.claude /tmp/x"}}')
+  assert_eq "ln -s ~/.claude (no slash) blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm -rf ~/.claude"}}')
+  assert_eq "rm -rf ~/.claude (no slash) blocked" "exit:2" "$result"
+
+  # False-positive guard: file with .claude extension that's NOT under ~/.claude/
+  result=$(run_hook "$HOOK" '{"tool_name":"Bash","tool_input":{"command":"rm myproject.claude"}}')
+  assert_eq "rm myproject.claude allowed (not under ~/.claude/)" "exit:0" "$result"
+
+  # ----- New Edit/Write/MultiEdit/NotebookEdit branch -----
+
+  # file_path under sensitive paths — blocked
+  result=$(run_hook "$HOOK" '{"tool_name":"Edit","tool_input":{"file_path":"~/.claude/settings.json","new_string":"foo"}}')
+  assert_eq "Edit ~/.claude/settings.json blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/Users/admin/.claude/hooks/new-evil-hook.py","content":"print(1)"}}')
+  assert_eq "Write to a NEW hook file under ~/.claude/hooks/ blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"MultiEdit","tool_input":{"file_path":"~/.claude/settings.local.json","edits":[{"old_string":"a","new_string":"b"}]}}')
+  assert_eq "MultiEdit ~/.claude/settings.local.json blocked" "exit:2" "$result"
+
+  # Memory system path under ~/.claude/projects/ — must remain writable
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/Users/admin/.claude/projects/foo/memory/x.md","content":"note"}}')
+  assert_eq "Write to ~/.claude/projects/ allowed (memory)" "exit:0" "$result"
+
+  # Other ~/.claude/ subtrees stay writable
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/Users/admin/.claude/agents/my-agent.md","content":"x"}}')
+  assert_eq "Write to ~/.claude/agents/ allowed" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/Users/admin/.claude/CLAUDE.md","content":"x"}}')
+  assert_eq "Write to ~/.claude/CLAUDE.md allowed" "exit:0" "$result"
+
+  # Source content tamper — authored Python that shells out to settings/hooks
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/innocent.py","content":"import os\nos.system(\"echo {} > ~/.claude/settings.json\")"}}')
+  assert_eq "Write innocent.py with os.system(>~/.claude/settings.json) blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/x.py","content":"import subprocess\nsubprocess.run([\"rm\", \"~/.claude/hooks/security-validator.py\"])"}}')
+  assert_eq "Write subprocess.run([rm, hook]) blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/x.py","content":"open(\"/Users/admin/.claude/settings.json\", \"w\").write(\"{}\")"}}')
+  assert_eq "Write open(settings.json, w) blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/x.py","content":"from pathlib import Path\nPath(\"~/.claude/hooks/security-validator.py\").unlink()"}}')
+  assert_eq "Write Path(hook).unlink() blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/x.js","content":"require(\"fs\").writeFileSync(\"~/.claude/settings.json\", \"{}\")"}}')
+  assert_eq "Write fs.writeFileSync(settings.json) blocked" "exit:2" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/x.js","content":"require(\"child_process\").exec(\"echo > ~/.claude/settings.json\")"}}')
+  assert_eq "Write child_process.exec(>settings.json) blocked" "exit:2" "$result"
+
+  # Source content NOT touching sensitive paths — allowed
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/x.py","content":"import os\nos.system(\"ls ~/.claude/\")"}}')
+  assert_eq "Write os.system(ls ~/.claude/) allowed (read, not write)" "exit:0" "$result"
+
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/innocent.py","content":"print(\"hello world\")"}}')
+  assert_eq "Write benign content allowed" "exit:0" "$result"
+
+  # Reading sensitive paths — read open() without write mode is allowed
+  result=$(run_hook "$HOOK" '{"tool_name":"Write","tool_input":{"file_path":"/tmp/x.py","content":"with open(\"~/.claude/settings.json\") as f: print(f.read())"}}')
+  assert_eq "Write open(settings.json) read-only allowed" "exit:0" "$result"
 teardown
 
 echo ""
@@ -784,6 +869,25 @@ for entry in data['hooks']['PreToolUse']:
       ((PASSED++)) ;;
     *)
       echo "  FAIL: env-exfil matcher unexpected: $matcher"
+      ((FAILED++)) ;;
+  esac
+
+  # tamper hook now also runs on Edit/Write/MultiEdit/NotebookEdit
+  tamper_matcher=$(python3 -c "
+import json
+data = json.load(open('$S'))
+for entry in data['hooks']['PreToolUse']:
+    for h in entry.get('hooks', []):
+        if h.get('command', '').endswith('prevent-claude-tamper.py'):
+            print(entry.get('matcher', ''))
+            break
+")
+  case "$tamper_matcher" in
+    *Bash*Edit*MultiEdit*Write*NotebookEdit*)
+      echo "  PASS: tamper matcher includes Edit/MultiEdit/Write/NotebookEdit"
+      ((PASSED++)) ;;
+    *)
+      echo "  FAIL: tamper matcher unexpected: $tamper_matcher"
       ((FAILED++)) ;;
   esac
 teardown
@@ -952,6 +1056,44 @@ JS
   assert_eq "missing command passes through" "exit:0" "$result"
 
   popd > /dev/null
+teardown
+
+echo ""
+echo "=== Test 21: install fails fast when python3 is unavailable ==="
+setup
+  FAKE_BIN="$FAKE_HOME/empty-bin"
+  mkdir -p "$FAKE_BIN"
+  # Symlink only the basics install.sh actually runs — deliberately exclude python3
+  for c in mkdir mktemp cp rm basename chmod cat ls dirname tr; do
+    src=$(command -v "$c") && ln -s "$src" "$FAKE_BIN/$c" 2>/dev/null || true
+  done
+
+  # Use absolute bash path — `PATH=$FAKE_BIN bash …` would look up `bash`
+  # in the (now sparse) FAKE_BIN.
+  BASH_BIN=$(command -v bash)
+  rc=0
+  output=$(PATH="$FAKE_BIN" "$BASH_BIN" "$SCRIPT_DIR/install.sh" 2>&1) || rc=$?
+
+  if [ "$rc" != "0" ]; then
+    echo "  PASS: install exited non-zero ($rc) when python3 was unavailable"
+    ((PASSED++))
+  else
+    echo "  FAIL: install exited 0 despite missing python3"
+    ((FAILED++))
+  fi
+
+  case "$output" in
+    *python3*)
+      echo "  PASS: install error message mentions python3"
+      ((PASSED++)) ;;
+    *)
+      echo "  FAIL: error didn't mention python3: $output"
+      ((FAILED++)) ;;
+  esac
+
+  # No partial install left behind
+  assert_file_not_exists "no settings.json from failed install" "$FAKE_HOME/.claude/settings.json"
+  assert_file_not_exists "no hooks dir from failed install" "$FAKE_HOME/.claude/hooks/security-validator.py"
 teardown
 
 # --- Summary ---

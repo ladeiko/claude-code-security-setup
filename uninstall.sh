@@ -6,6 +6,13 @@ set -euo pipefail
 #   - https://gist.github.com/sgasser/efeb186bad7e68c146d6692ec05c1a57
 #   - https://github.com/henryklunaris/claude-code-security
 
+# Verify python3 is available — uninstall edits settings.json via Python.
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c '' >/dev/null 2>&1; then
+  echo "Error: python3 is required but not found or not runnable in PATH." >&2
+  echo "Install Python 3 (https://python.org) and re-run." >&2
+  exit 1
+fi
+
 CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
