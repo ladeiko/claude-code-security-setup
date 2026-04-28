@@ -17,8 +17,9 @@ HOOK_FILES=(
   "$HOOKS_DIR/prevent-claude-tamper.py"
 )
 
-# Temporary backup directory (cleaned up on success)
-BACKUP_DIR=$(mktemp -d)
+# Temporary backup directory under $HOME (mode 700) — keeps secrets/settings
+# off shared /tmp during install, and in a stable location under user control.
+BACKUP_DIR=$(umask 077 && mktemp -d "$HOME/.claude-security-setup-backup.XXXXXX")
 BACKED_UP_SETTINGS=false
 
 cleanup_on_success() {
@@ -77,11 +78,15 @@ if [ ! -f "$SETTINGS_FILE" ]; then
   echo "{}" > "$SETTINGS_FILE"
 fi
 
-# Merge into settings.json
-python3 -c "
-import json
+# Merge into settings.json. Pass the path via argv so the Python source
+# doesn't shell-interpolate user paths (defends against $HOME containing
+# special characters and keeps the heredoc readable).
+python3 - "$SETTINGS_FILE" <<'PY'
+import sys, json
 
-with open('$SETTINGS_FILE') as f:
+settings_file = sys.argv[1]
+
+with open(settings_file) as f:
     settings = json.load(f)
 
 # --- Merge permissions.deny (append only missing) ---
@@ -220,10 +225,10 @@ for entry in hook_entries:
     if not already_present:
         pre_tool_use.append(entry)
 
-with open('$SETTINGS_FILE', 'w') as f:
+with open(settings_file, 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
-"
+PY
 
 echo "Updated $SETTINGS_FILE"
 

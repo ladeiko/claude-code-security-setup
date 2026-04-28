@@ -655,6 +655,145 @@ setup
   done
 teardown
 
+echo ""
+echo "=== Test 16: deny rules contain key entries (content, not just count) ==="
+setup
+  bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
+  S="$FAKE_HOME/.claude/settings.json"
+
+  # Spot-check one entry per category. If install.sh ever silently drops
+  # a rule, count-based assertions wouldn't notice — these would.
+  for rule in \
+    'Read(**/.env)' \
+    'Read(**/.env.*)' \
+    'Read(**/.ssh/id_*)' \
+    'Read(**/id_rsa*)' \
+    'Read(**/id_ed25519*)' \
+    'Read(**/.aws/credentials)' \
+    'Read(**/.aws/config)' \
+    'Read(**/*.pem)' \
+    'Read(**/.kube/config)' \
+    'Read(**/.git-credentials)' \
+    'Read(**/.mcp.json)' \
+    'Bash(sudo *)' \
+    'Bash(/usr/bin/sudo *)' \
+    'Bash(su *)' \
+    'Bash(shred *)' \
+    'Bash(unlink *)' \
+    'Bash(git rm *)' \
+    'Bash(git clean *)' \
+    'Bash(git push --force*)' \
+    'Bash(git reset --hard*)' \
+    'Bash(git -C * rm *)' \
+    'Bash(git push * +*:*)' \
+    'Bash(cat .env*)' \
+    'Edit(~/.claude/settings.json)' \
+    'Write(~/.claude/settings.json)' \
+    'Edit(~/.claude/hooks/security-validator.py)' \
+    'Edit(~/.claude/hooks/prevent-force-push.py)' \
+    'Edit(~/.claude/hooks/prevent-env-exfil.py)' \
+    'Edit(~/.claude/hooks/prevent-claude-tamper.py)' \
+    'Bash(rm ~/.claude/*)' \
+    'Bash(rm -rf ~/.claude*)' \
+    'Bash(chmod * ~/.claude/*)' \
+    'Bash(tee ~/.claude/*)' \
+    'Bash(* > ~/.claude/*)' \
+    'Bash(* >> ~/.claude/*)' \
+  ; do
+    has=$(json_contains "$S" "data['permissions']['deny']" "'$rule'")
+    assert_eq "deny contains $rule" "true" "$has"
+  done
+teardown
+
+echo ""
+echo "=== Test 17: PreToolUse contains all four managed hooks ==="
+setup
+  bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
+  S="$FAKE_HOME/.claude/settings.json"
+
+  for cmd in \
+    "~/.claude/hooks/security-validator.py" \
+    "~/.claude/hooks/prevent-force-push.py" \
+    "~/.claude/hooks/prevent-env-exfil.py" \
+    "~/.claude/hooks/prevent-claude-tamper.py" \
+  ; do
+    found=$(python3 -c "
+import json
+data = json.load(open('$S'))
+target = '$cmd'
+result = 'false'
+for entry in data.get('hooks', {}).get('PreToolUse', []):
+    for h in entry.get('hooks', []):
+        if h.get('command') == target:
+            result = 'true'
+print(result)
+")
+    assert_eq "PreToolUse contains $cmd" "true" "$found"
+  done
+
+  # env-exfil hook must use the broad matcher including MultiEdit
+  matcher=$(python3 -c "
+import json
+data = json.load(open('$S'))
+for entry in data['hooks']['PreToolUse']:
+    for h in entry.get('hooks', []):
+        if h.get('command', '').endswith('prevent-env-exfil.py'):
+            print(entry.get('matcher', ''))
+            break
+")
+  case "$matcher" in
+    *Bash*Edit*MultiEdit*Write*NotebookEdit*Read*Grep*Glob*)
+      echo "  PASS: env-exfil matcher includes MultiEdit and Read/Grep/Glob"
+      ((PASSED++)) ;;
+    *)
+      echo "  FAIL: env-exfil matcher unexpected: $matcher"
+      ((FAILED++)) ;;
+  esac
+teardown
+
+echo ""
+echo "=== Test 18: install/uninstall tolerate unusual \$HOME (path injection guard) ==="
+setup
+  # Re-home to a path containing a single quote — would have broken the
+  # old shell-interpolated python invocation.
+  WEIRD="$FAKE_HOME/it's a home/.claude_user"
+  mkdir -p "$WEIRD"
+  export HOME="$WEIRD"
+
+  bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1
+  rc=$?
+  assert_eq "install succeeds with quote in \$HOME" "0" "$rc"
+  assert_file_exists "settings.json created in weird HOME" "$WEIRD/.claude/settings.json"
+  assert_file_exists "hook created in weird HOME" "$WEIRD/.claude/hooks/security-validator.py"
+
+  bash "$SCRIPT_DIR/uninstall.sh" > /dev/null 2>&1
+  rc=$?
+  assert_eq "uninstall succeeds with quote in \$HOME" "0" "$rc"
+  assert_file_not_exists "hook removed from weird HOME" "$WEIRD/.claude/hooks/security-validator.py"
+teardown
+
+echo ""
+echo "=== Test 19: backup dir lives under \$HOME, not /tmp ==="
+setup
+  # Sabotage settings.json so the python merge fails after backup creation,
+  # forcing rollback. Then assert no backup leftover anywhere.
+  mkdir -p "$FAKE_HOME/.claude"
+  echo "this is not json" > "$FAKE_HOME/.claude/settings.json"
+
+  # /tmp baseline before
+  before_tmp=$(ls -d /tmp/tmp.* 2>/dev/null | wc -l | tr -d ' ')
+
+  bash "$SCRIPT_DIR/install.sh" > /dev/null 2>&1 || true
+
+  # No backup dir should remain in $HOME (rollback cleans up)
+  remaining_home=$(ls -d "$FAKE_HOME"/.claude-security-setup-backup.* 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq "no leftover backup dir in \$HOME after rollback" "0" "$remaining_home"
+
+  # And /tmp should not have grown a tmp.* dir from this run
+  after_tmp=$(ls -d /tmp/tmp.* 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq "no /tmp/tmp.* leftover from install" "$before_tmp" "$after_tmp"
+teardown
+
 # --- Summary ---
 echo ""
 echo "==============================="

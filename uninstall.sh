@@ -17,8 +17,9 @@ HOOK_FILES=(
   "$HOOKS_DIR/prevent-claude-tamper.py"
 )
 
-# Temporary backup directory (cleaned up on success)
-BACKUP_DIR=$(mktemp -d)
+# Temporary backup directory under $HOME (mode 700) — keeps backups off
+# shared /tmp during uninstall.
+BACKUP_DIR=$(umask 077 && mktemp -d "$HOME/.claude-security-setup-backup.XXXXXX")
 BACKED_UP_SETTINGS=false
 
 cleanup_on_success() {
@@ -64,12 +65,14 @@ for hook in "${HOOK_FILES[@]}"; do
   fi
 done
 
-# Remove security rules from settings.json
+# Remove security rules from settings.json. Path passed via argv (see install.sh).
 if [ -f "$SETTINGS_FILE" ]; then
-  python3 -c "
-import json
+  python3 - "$SETTINGS_FILE" <<'PY'
+import sys, json
 
-with open('$SETTINGS_FILE') as f:
+settings_file = sys.argv[1]
+
+with open(settings_file) as f:
     settings = json.load(f)
 
 # --- Remove deny rules added by install ---
@@ -204,10 +207,10 @@ else:
 if not hooks:
     settings.pop('hooks', None)
 
-with open('$SETTINGS_FILE', 'w') as f:
+with open(settings_file, 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
-"
+PY
   echo "Cleaned $SETTINGS_FILE"
 else
   echo "No $SETTINGS_FILE found — skipping"
